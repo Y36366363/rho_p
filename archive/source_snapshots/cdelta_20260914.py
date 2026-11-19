@@ -1,0 +1,2724 @@
+"""Original c-delta utilities and robust-reference profile inference.
+
+The all-to-all divergence coefficient and the Yao--Hoorn robust-reference
+profile correlation are kept as distinct constructs.  Formulas remain explicit
+so the implementation can support both reproducible simulations and the
+methodological manuscript.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from itertools import permutations
+from math import comb
+from statistics import NormalDist
+from typing import Callable
+import numpy as np
+
+
+Array = np.ndarray
+
+
+@dataclass(frozen=True)
+class CDeltaResult:
+    raw: float
+    normalized_pairing: float
+    direction_correlation: float
+    dx: Array
+    dy: Array
+    status: str = "ok"
+
+
+def _as_1d(values: Array | list[float], name: str) -> Array:
+    arr = np.asarray(values, dtype=float)
+    if arr.ndim != 1:
+        raise ValueError(f"{name} must be one-dimensional")
+    if arr.size < 3:
+        raise ValueError(f"{name} must contain at least three observations")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{name} must contain only finite values")
+    return arr
+
+
+def _background_sample(
+    rng: np.random.Generator,
+    n: int,
+    background: str,
+) -> Array:
+    if background == "normal":
+        return rng.normal(size=n)
+    if background == "t3":
+        return rng.standard_t(df=3, size=n)
+    if background == "t2":
+        return rng.standard_t(df=2, size=n)
+    if background == "lognormal":
+        values = rng.lognormal(mean=0.0, sigma=0.8, size=n)
+        return (values - float(values.mean())) / float(values.std())
+
+    raise ValueError(f"unknown background: {background}")
+
+
+def divergence_vector(values: Array | list[float], *, kind: str = "l2") -> Array:
+    """Return each observation's average divergence from all others."""
+    x = _as_1d(values, "values")
+    diffs = x[:, None] - x[None, :]
+    mask = ~np.eye(x.size, dtype=bool)
+
+    if kind == "l2":
+        squared = diffs**2
+        return np.sqrt(squared[mask].reshape(x.size, x.size - 1).mean(axis=1))
+    if kind == "l1":
+        absolute = np.abs(diffs)
+        return absolute[mask].reshape(x.size, x.size - 1).mean(axis=1)
+
+    raise ValueError("kind must be 'l2' or 'l1'")
+
+
+def center_salience_vector(
+    values: Array | list[float],
+    *,
+    center: str = "mean",
+    cap: float | None = None,
+    trim_fraction: float = 0.10,
+    huber_c: float = 1.345,
+    soft_cap: bool = False,
+) -> Array:
+    """Return distances to a location estimate, optionally robustly capped.
+
+    ``mean`` is the one-cluster k-means/geometric-centroid proposal.
+    ``median`` uses a high-breakdown location estimate. ``trimmed_mean`` and
+    ``huber`` provide smooth alternatives. ``iqr_inlier_mean`` implements the
+    two-stage proposal: identify an ordinary subset with the 1.5-IQR rule, fit
+    the centre without flagged observations, and then score *all* observations
+    relative to that centre.
+
+    If ``cap`` is supplied, distances are truncated at ``cap`` robust scale
+    units.  This changes the goal from robust centre estimation with retained
+    outlier signal to bounded outlier influence on the final profile.
+    """
+    x = _as_1d(values, "values")
+    if center == "mean":
+        location = float(x.mean())
+        fit_values = x
+    elif center == "median":
+        location = float(np.median(x))
+        fit_values = x
+    elif center == "trimmed_mean":
+        if not 0.0 <= trim_fraction < 0.5:
+            raise ValueError("trim_fraction must be in [0, 0.5)")
+        trim = int(np.floor(trim_fraction * x.size))
+        if x.size - 2 * trim < 3:
+            raise ValueError("trim_fraction leaves too few observations")
+        fit_values = np.sort(x)[trim : x.size - trim]
+        location = float(fit_values.mean())
+    elif center == "huber":
+        if huber_c <= 0.0:
+            raise ValueError("huber_c must be positive")
+        location = float(np.median(x))
+        fit_values = x
+        scale = 1.4826 * float(np.median(np.abs(x - location)))
+        if scale == 0.0:
+            scale = float(np.mean(np.abs(x - location)))
+        if scale > 0.0:
+            for _ in range(50):
+                residual = (x - location) / scale
+                weights = np.minimum(1.0, huber_c / np.maximum(np.abs(residual), 1e-15))
+                updated = float(np.sum(weights * x) / np.sum(weights))
+                if abs(updated - location) < 1e-10 * max(1.0, scale):
+                    location = updated
+                    break
+                location = updated
+    elif center == "iqr_inlier_mean":
+        q1, q3 = np.quantile(x, [0.25, 0.75])
+        iqr = float(q3 - q1)
+        if iqr == 0.0:
+            fit_values = x
+        else:
+            fit_values = x[(x >= q1 - 1.5 * iqr) & (x <= q3 + 1.5 * iqr)]
+            if fit_values.size < 3:
+                fit_values = x
+        location = float(fit_values.mean())
+    else:
+        raise ValueError(
+            "center must be 'mean', 'median', 'trimmed_mean', 'huber', or "
+            "'iqr_inlier_mean'"
+        )
+
+    scores = np.abs(x - location)
+    if cap is None:
+        return scores
+    if cap <= 0.0:
+        raise ValueError("cap must be positive")
+
+    fit_deviations = np.abs(fit_values - location)
+    scale = 1.4826 * float(np.median(fit_deviations))
+    if scale == 0.0:
+        scale = float(np.mean(fit_deviations))
+    if scale == 0.0:
+        return scores
+    threshold = cap * scale
+    if soft_cap:
+        return threshold * np.tanh(scores / threshold)
+    return np.minimum(scores, threshold)
+
+
+def huber_reference_profile(
+    values: Array | list[float],
+    *,
+    huber_c: float = 1.345,
+    radial_floor: float = 0.0,
+    cap: float | None = None,
+    soft_cap: bool = False,
+) -> Array:
+    """Return a dimensionless Huber robust-reference salience profile.
+
+    The marginal reference location is fitted with a fixed MAD scale.  Every
+    observation is then scored, including observations that had little
+    influence on the fitted location.  ``radial_floor=0`` gives the primary
+    absolute-radius proposal.  Positive values give the regularised profile
+
+        sqrt(((x_i - T) / s)^2 + radial_floor^2),
+
+    which preserves the variance-floor geometry of the original one-
+    dimensional L2 divergence while replacing its non-robust mean and scale.
+    This is an exploratory structural comparator, not a new default.
+    """
+    x = _as_1d(values, "values")
+    if huber_c <= 0.0:
+        raise ValueError("huber_c must be positive")
+    if radial_floor < 0.0:
+        raise ValueError("radial_floor must be nonnegative")
+    if cap is not None and cap <= 0.0:
+        raise ValueError("cap must be positive")
+
+    median = float(np.median(x))
+    scale = 1.4826 * float(np.median(np.abs(x - median)))
+    if scale == 0.0:
+        scale = float(np.mean(np.abs(x - median)))
+    if scale == 0.0:
+        scale = float(np.std(x))
+    if scale == 0.0:
+        return np.zeros_like(x)
+
+    location = median
+    for _ in range(100):
+        residual = (x - location) / scale
+        weights = np.minimum(1.0, huber_c / np.maximum(np.abs(residual), 1e-15))
+        updated = float(np.sum(weights * x) / np.sum(weights))
+        if abs(updated - location) < 1e-10 * max(1.0, scale):
+            location = updated
+            break
+        location = updated
+
+    standardized_radius = np.abs(x - location) / scale
+    scores = np.sqrt(standardized_radius**2 + radial_floor**2)
+    if cap is None:
+        return scores
+    if soft_cap:
+        return cap * np.tanh(scores / cap)
+    return np.minimum(scores, cap)
+
+
+def h_star_profile(
+    values: Array | list[float],
+    *,
+    eta: float = 2.0,
+) -> Array:
+    """Return a leave-one-out h-star-style score for every observation.
+
+    For candidate ``i``, the numerator is its Holder-mean distance to all
+    other observations and the denominator is the Holder-mean pairwise
+    distance among the remaining observations.  This extends the single
+    pre-selected candidate construction of Hoorn and Ho to an observation
+    profile suitable for paired-salience comparison.  It is an exploratory
+    bridge, not the inferential h-star test from that paper.
+    """
+    x = _as_1d(values, "values")
+    if eta <= 0.0:
+        raise ValueError("eta must be positive")
+
+    distances = np.abs(x[:, None] - x[None, :]) ** eta
+    scores = np.empty(x.size, dtype=float)
+    total_pair_sum = float(np.sum(np.triu(distances, k=1)))
+    ordinary_pair_count = comb(x.size - 1, 2)
+    for i in range(x.size):
+        candidate_pair_sum = float(np.sum(distances[i]))
+        signal = candidate_pair_sum / (x.size - 1)
+        noise = (total_pair_sum - candidate_pair_sum) / ordinary_pair_count
+        scores[i] = (signal / noise) ** (1.0 / eta) if noise > 0.0 else np.nan
+    return scores
+
+
+def l2_divergence_closed_form(values: Array | list[float]) -> Array:
+    """Return the exact one-dimensional L2 divergence in centered form.
+
+    If ``s2`` is the population variance, then
+
+        D_i^2 = n / (n - 1) * ((x_i - x_bar)^2 + s2).
+
+    Hence the L2 divergence ranking is exactly the ranking of absolute
+    deviations from the sample mean.
+    """
+    x = _as_1d(values, "values")
+    centered = x - float(x.mean())
+    population_variance = float(np.mean(centered**2))
+    return np.sqrt(
+        x.size / (x.size - 1) * (centered**2 + population_variance)
+    )
+
+
+def c_delta(
+    x: Array | list[float],
+    y: Array | list[float],
+    *,
+    kind: str = "l2",
+    zero_policy: str = "undetermined",
+) -> CDeltaResult:
+    """Compute corrected raw c_delta and a sample-dependent pairing normalization.
+
+    The raw numerator is the empirical mean of paired divergence products,
+    `(1 / n) * sum_i D_xi D_yi`, divided by the product of the two mean
+    divergences.
+
+    The normalized value uses the maximum dot product obtainable by re-pairing
+    the two divergence vectors, which is a finite-sample upper anchor for the
+    observed x-y pairing. This is a pragmatic simulation anchor, not a universal
+    theoretical bound.
+    """
+    x_arr = _as_1d(x, "x")
+    y_arr = _as_1d(y, "y")
+    if x_arr.size != y_arr.size:
+        raise ValueError("x and y must have the same length")
+
+    dx = divergence_vector(x_arr, kind=kind)
+    dy = divergence_vector(y_arr, kind=kind)
+    mean_dx = float(dx.mean())
+    mean_dy = float(dy.mean())
+
+    if mean_dx == 0.0 or mean_dy == 0.0:
+        message = "undetermined due to data limitations"
+        if zero_policy in {"undetermined", "nan"}:
+            return CDeltaResult(np.nan, np.nan, np.nan, dx, dy, message)
+        raise ValueError(message)
+
+    raw = float(np.mean(dx * dy) / (mean_dx * mean_dy))
+    max_pairing = float(
+        np.mean(np.sort(dx) * np.sort(dy)) / (mean_dx * mean_dy)
+    )
+    normalized = raw / max_pairing if max_pairing > 0.0 else np.nan
+
+    if np.std(dx) == 0.0 or np.std(dy) == 0.0:
+        direction = np.nan
+    else:
+        direction = float(np.corrcoef(dx, dy)[0, 1])
+
+    return CDeltaResult(raw, float(normalized), direction, dx, dy)
+
+
+def _raw_from_divergences(dx: Array, dy: Array) -> float:
+    mean_dx = float(dx.mean())
+    mean_dy = float(dy.mean())
+    if mean_dx == 0.0 or mean_dy == 0.0:
+        return np.nan
+    return float(np.mean(dx * dy) / (mean_dx * mean_dy))
+
+
+def c_delta_from_profiles(
+    sx: Array | list[float], sy: Array | list[float]
+) -> dict[str, float | str]:
+    """Compute corrected c_delta from two pre-computed salience profiles.
+
+    The profile construction is deliberately separated from the pairing
+    statistic.  This makes robust-reference and bounded-influence variants
+    explicit while preserving the same permutation calibration machinery.
+    """
+    sx_arr = _as_1d(sx, "sx")
+    sy_arr = _as_1d(sy, "sy")
+    if sx_arr.size != sy_arr.size:
+        raise ValueError("sx and sy must have the same length")
+    mean_x, mean_y = float(sx_arr.mean()), float(sy_arr.mean())
+    if mean_x == 0.0 or mean_y == 0.0:
+        return {
+            "raw": np.nan,
+            "correlation": np.nan,
+            "status": "undetermined due to data limitations",
+        }
+    raw = float(np.mean(sx_arr * sy_arr) / (mean_x * mean_y))
+    if sx_arr.std() == 0.0 or sy_arr.std() == 0.0:
+        correlation = np.nan
+    else:
+        correlation = float(np.corrcoef(sx_arr, sy_arr)[0, 1])
+    return {"raw": raw, "correlation": correlation, "status": "ok"}
+
+
+def profile_permutation_reference(
+    sx: Array | list[float],
+    sy: Array | list[float],
+    *,
+    blocks: Array | list[object] | None = None,
+) -> float:
+    """Return the exact mean c_delta under the allowed permutation group.
+
+    For unrestricted permutations the reference is one.  For within-block
+    permutations it is
+
+        sum_b sum(sx_b) sum(sy_b) / n_b / n
+        --------------------------------------,
+                  mean(sx) mean(sy)
+
+    because between-block profile differences are held fixed.
+    """
+    sx_arr = _as_1d(sx, "sx")
+    sy_arr = _as_1d(sy, "sy")
+    if sx_arr.size != sy_arr.size:
+        raise ValueError("sx and sy must have the same length")
+    denominator = float(sx_arr.mean() * sy_arr.mean())
+    if denominator == 0.0:
+        return np.nan
+    if blocks is None:
+        return 1.0
+    block_labels = np.asarray(blocks)
+    if block_labels.ndim != 1 or block_labels.size != sx_arr.size:
+        raise ValueError("blocks must be one-dimensional and match profile length")
+    expected_product_sum = 0.0
+    for label in np.unique(block_labels):
+        members = np.flatnonzero(block_labels == label)
+        expected_product_sum += (
+            float(np.sum(sx_arr[members]))
+            * float(np.sum(sy_arr[members]))
+            / members.size
+        )
+    return float(expected_product_sum / sx_arr.size / denominator)
+
+
+def permutation_test_profiles(
+    sx: Array | list[float],
+    sy: Array | list[float],
+    *,
+    n_perm: int = 999,
+    seed: int | None = None,
+    alternative: str = "greater",
+    blocks: Array | list[object] | None = None,
+) -> dict[str, float | str]:
+    """Permutation test for fixed separately fitted profiles.
+
+    When ``blocks`` is supplied, observations are rearranged only within equal
+    block labels.  This supports a conditional exchangeability null for
+    stratified or matched designs.  The resulting permutation reference mean
+    need not equal one because between-block salience is deliberately held
+    fixed, so it is returned explicitly for reporting.
+    """
+    if alternative not in {"greater", "less", "two-sided"}:
+        raise ValueError("alternative must be 'greater', 'less', or 'two-sided'")
+    if n_perm < 1:
+        raise ValueError("n_perm must be positive")
+    sx_arr = _as_1d(sx, "sx")
+    sy_arr = _as_1d(sy, "sy")
+    if sx_arr.size != sy_arr.size:
+        raise ValueError("sx and sy must have the same length")
+    block_members: list[np.ndarray] | None = None
+    if blocks is not None:
+        block_labels = np.asarray(blocks)
+        if block_labels.ndim != 1 or block_labels.size != sx_arr.size:
+            raise ValueError("blocks must be one-dimensional and match profile length")
+        block_members = [
+            np.flatnonzero(block_labels == label) for label in np.unique(block_labels)
+        ]
+    observed = c_delta_from_profiles(sx_arr, sy_arr)
+    if observed["status"] != "ok":
+        return {"observed": np.nan, "p_value": np.nan, "alternative": alternative,
+                "status": observed["status"]}
+    rng = np.random.default_rng(seed)
+    mean_x, mean_y = float(sx_arr.mean()), float(sy_arr.mean())
+    observed_raw = float(observed["raw"])
+    reference_exact = profile_permutation_reference(sx_arr, sy_arr, blocks=blocks)
+    exceed = 0
+    statistics: list[float] = []
+    for _ in range(n_perm):
+        if block_members is None:
+            permuted_sy = rng.permutation(sy_arr)
+        else:
+            permuted_sy = sy_arr.copy()
+            for members in block_members:
+                permuted_sy[members] = sy_arr[rng.permutation(members)]
+        stat = float(np.mean(sx_arr * permuted_sy) / (mean_x * mean_y))
+        statistics.append(stat)
+        if alternative == "greater":
+            exceed += stat >= observed_raw
+        elif alternative == "less":
+            exceed += stat <= observed_raw
+        else:
+            exceed += abs(stat - reference_exact) >= abs(
+                observed_raw - reference_exact
+            )
+    return {
+        "observed": observed_raw,
+        "p_value": float((exceed + 1) / (n_perm + 1)),
+        "permutation_reference_mean": float(np.mean(statistics)),
+        "permutation_reference_exact": reference_exact,
+        "alternative": alternative,
+        "status": "ok",
+    }
+
+
+def robust_profile_bootstrap_ci(
+    x: Array | list[float],
+    y: Array | list[float],
+    *,
+    center: str = "iqr_inlier_mean",
+    cap: float | None = None,
+    n_boot: int = 2000,
+    seed: int | None = None,
+    alpha: float = 0.05,
+) -> dict[str, float]:
+    """Bootstrap c_delta CI, refitting each robust centre in every resample."""
+    x_arr = _as_1d(x, "x")
+    y_arr = _as_1d(y, "y")
+    if x_arr.size != y_arr.size:
+        raise ValueError("x and y must have the same length")
+    rng = np.random.default_rng(seed)
+    stats: list[float] = []
+    for _ in range(n_boot):
+        indices = rng.integers(0, x_arr.size, size=x_arr.size)
+        sx = center_salience_vector(x_arr[indices], center=center, cap=cap)
+        sy = center_salience_vector(y_arr[indices], center=center, cap=cap)
+        value = c_delta_from_profiles(sx, sy)["raw"]
+        if np.isfinite(value):
+            stats.append(float(value))
+    if not stats:
+        raise ValueError("all bootstrap samples were undetermined")
+    lower, upper = np.quantile(stats, [alpha / 2, 1 - alpha / 2])
+    estimate = c_delta_from_profiles(
+        center_salience_vector(x_arr, center=center, cap=cap),
+        center_salience_vector(y_arr, center=center, cap=cap),
+    )["raw"]
+    return {
+        "estimate": float(estimate),
+        "lower": float(lower),
+        "upper": float(upper),
+        "n_used": float(len(stats)),
+    }
+
+
+def huber_cdelta_bootstrap_intervals(
+    x: Array | list[float],
+    y: Array | list[float],
+    *,
+    huber_c: float = 1.345,
+    cap: float | None = None,
+    n_boot: int = 999,
+    seed: int | None = None,
+    alpha: float = 0.05,
+) -> dict[str, float | dict[str, float]]:
+    """Return percentile, basic, and BCa intervals for Huber c_delta.
+
+    Paired observations are resampled together and both marginal Huber
+    profiles are refitted in every bootstrap and jackknife sample.  BCa uses
+    the ordinary leave-one-pair-out acceleration estimate.
+    """
+    x_arr = _as_1d(x, "x")
+    y_arr = _as_1d(y, "y")
+    if x_arr.size != y_arr.size:
+        raise ValueError("x and y must have the same length")
+    if x_arr.size < 4:
+        raise ValueError("at least four pairs are required for jackknife BCa")
+    if n_boot < 20:
+        raise ValueError("n_boot must be at least 20")
+    if not 0.0 < alpha < 1.0:
+        raise ValueError("alpha must be between zero and one")
+
+    def estimate(x_values: Array, y_values: Array) -> float:
+        result = c_delta_from_profiles(
+            huber_reference_profile(x_values, huber_c=huber_c, cap=cap),
+            huber_reference_profile(y_values, huber_c=huber_c, cap=cap),
+        )
+        return float(result["raw"])
+
+    observed = estimate(x_arr, y_arr)
+    if not np.isfinite(observed):
+        raise ValueError("observed Huber c_delta is undetermined")
+
+    rng = np.random.default_rng(seed)
+    bootstrap: list[float] = []
+    for _ in range(n_boot):
+        indices = rng.integers(0, x_arr.size, size=x_arr.size)
+        value = estimate(x_arr[indices], y_arr[indices])
+        if np.isfinite(value):
+            bootstrap.append(value)
+    if len(bootstrap) < max(20, n_boot // 2):
+        raise ValueError("too many bootstrap samples were undetermined")
+    bootstrap_arr = np.asarray(bootstrap)
+
+    lower_q, upper_q = np.quantile(
+        bootstrap_arr, [alpha / 2.0, 1.0 - alpha / 2.0]
+    )
+    percentile = {"lower": float(lower_q), "upper": float(upper_q)}
+    basic = {
+        "lower": float(2.0 * observed - upper_q),
+        "upper": float(2.0 * observed - lower_q),
+    }
+    bootstrap_standard_error = float(np.std(bootstrap_arr, ddof=1))
+    normal_quantile = NormalDist().inv_cdf(1.0 - alpha / 2.0)
+    normal_interval = {
+        "lower": float(observed - normal_quantile * bootstrap_standard_error),
+        "upper": float(observed + normal_quantile * bootstrap_standard_error),
+    }
+
+    jackknife = []
+    for omitted in range(x_arr.size):
+        keep = np.arange(x_arr.size) != omitted
+        value = estimate(x_arr[keep], y_arr[keep])
+        if np.isfinite(value):
+            jackknife.append(value)
+    if len(jackknife) != x_arr.size:
+        raise ValueError("a jackknife sample was undetermined")
+    jackknife_arr = np.asarray(jackknife)
+    jackknife_mean = float(np.mean(jackknife_arr))
+    deviations = jackknife_mean - jackknife_arr
+    squared_sum = float(np.sum(deviations**2))
+    acceleration = (
+        float(np.sum(deviations**3)) / (6.0 * squared_sum**1.5)
+        if squared_sum > 0.0
+        else 0.0
+    )
+
+    normal = NormalDist()
+    minimum_probability = 0.5 / len(bootstrap_arr)
+    below = float(np.mean(bootstrap_arr < observed))
+    below = min(max(below, minimum_probability), 1.0 - minimum_probability)
+    bias_correction = normal.inv_cdf(below)
+
+    def adjusted_probability(probability: float) -> float:
+        z_alpha = normal.inv_cdf(probability)
+        numerator = bias_correction + z_alpha
+        denominator = 1.0 - acceleration * numerator
+        adjusted = normal.cdf(bias_correction + numerator / denominator)
+        return min(max(adjusted, 0.0), 1.0)
+
+    bca_probabilities = (
+        adjusted_probability(alpha / 2.0),
+        adjusted_probability(1.0 - alpha / 2.0),
+    )
+    bca_q = np.quantile(bootstrap_arr, bca_probabilities)
+    bca = {"lower": float(bca_q[0]), "upper": float(bca_q[1])}
+
+    return {
+        "estimate": observed,
+        "percentile": percentile,
+        "basic": basic,
+        "bca": bca,
+        "normal": normal_interval,
+        "bootstrap_standard_error": bootstrap_standard_error,
+        "bias_correction": float(bias_correction),
+        "acceleration": acceleration,
+        "n_boot_used": float(len(bootstrap_arr)),
+    }
+
+
+def direct_profile_influence_standard_error(
+    sx: Array | list[float], sy: Array | list[float]
+) -> dict[str, float]:
+    """Estimate c_delta SE from the fixed-profile ratio influence function.
+
+    This treats the two fitted profiles as observed paired variables.  It does
+    not include uncertainty from estimating their marginal reference centres,
+    so it is complete only when the corresponding nuisance coefficients vanish
+    or when used as a diagnostic comparator.
+    """
+    sx_arr = _as_1d(sx, "sx")
+    sy_arr = _as_1d(sy, "sy")
+    if sx_arr.size != sy_arr.size:
+        raise ValueError("sx and sy must have the same length")
+    mean_x, mean_y = float(sx_arr.mean()), float(sy_arr.mean())
+    if mean_x == 0.0 or mean_y == 0.0:
+        raise ValueError("profile influence is undetermined")
+    estimate = float(np.mean(sx_arr * sy_arr) / (mean_x * mean_y))
+    influence = (
+        sx_arr * sy_arr / (mean_x * mean_y)
+        - estimate * sx_arr / mean_x
+        - estimate * sy_arr / mean_y
+        + estimate
+    )
+    standard_error = float(np.std(influence, ddof=1) / np.sqrt(sx_arr.size))
+    return {
+        "estimate": estimate,
+        "standard_error": standard_error,
+        "mean_influence": float(np.mean(influence)),
+        "max_absolute_influence": float(np.max(np.abs(influence))),
+    }
+
+
+def _gaussian_kde_density(values: Array, point: float) -> float:
+    """Return a simple one-dimensional Gaussian KDE density estimate."""
+    n = values.size
+    standard_deviation = float(np.std(values, ddof=1))
+    bandwidth = 1.06 * standard_deviation * n ** (-0.2)
+    if bandwidth <= 0.0:
+        raise ValueError("density estimation is undetermined")
+    standardized = (values - point) / bandwidth
+    return float(
+        np.mean(np.exp(-0.5 * standardized**2))
+        / (np.sqrt(2.0 * np.pi) * bandwidth)
+    )
+
+
+def _influence_density_values(
+    values: Array,
+    points: tuple[float, float, float],
+    *,
+    method: str,
+    analytic_density: Callable[[float], float] | None,
+    folds: int,
+    seed: int,
+) -> tuple[Array, Array, Array]:
+    """Return density values used by each observation's marginal IF."""
+    n = values.size
+    if method == "analytic":
+        if analytic_density is None:
+            raise ValueError("analytic_density is required for analytic density")
+        estimates = [float(analytic_density(point)) for point in points]
+        if min(estimates) <= 0.0 or not np.all(np.isfinite(estimates)):
+            raise ValueError("analytic density must be finite and positive")
+        return tuple(np.full(n, estimate) for estimate in estimates)  # type: ignore[return-value]
+    if method == "kde":
+        estimates = [_gaussian_kde_density(values, point) for point in points]
+        return tuple(np.full(n, estimate) for estimate in estimates)  # type: ignore[return-value]
+    if method != "crossfit_kde":
+        raise ValueError("density_method must be 'kde', 'crossfit_kde', or 'analytic'")
+    if folds < 2 or folds > n // 3:
+        raise ValueError("density_folds must be between 2 and n // 3")
+
+    rng = np.random.default_rng(seed)
+    assignments = np.arange(n) % folds
+    rng.shuffle(assignments)
+    outputs = [np.empty(n), np.empty(n), np.empty(n)]
+    for fold in range(folds):
+        held_out = assignments == fold
+        training = values[~held_out]
+        for output, point in zip(outputs, points):
+            output[held_out] = _gaussian_kde_density(training, point)
+    return outputs[0], outputs[1], outputs[2]
+
+
+def _huber_location_influence(
+    values: Array,
+    *,
+    huber_c: float,
+    density_method: str,
+    analytic_density: Callable[[float], float] | None,
+    density_folds: int,
+    density_seed: int,
+) -> tuple[float, float, Array]:
+    """Fit the Huber centre and return its plug-in influence values.
+
+    The fixed scale in the Huber equation is the normal-consistent MAD.  The
+    returned influence therefore includes both the median term in the MAD and
+    the MAD's indirect contribution to the Huber location.
+    """
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median)))
+    scale = 1.4826 * mad
+    if scale <= 0.0:
+        raise ValueError("Huber influence is undetermined for zero MAD")
+
+    location = median
+    for _ in range(100):
+        residual = (values - location) / scale
+        weights = np.minimum(
+            1.0, huber_c / np.maximum(np.abs(residual), 1e-15)
+        )
+        updated = float(np.sum(weights * values) / np.sum(weights))
+        if abs(updated - location) < 1e-10 * max(1.0, scale):
+            location = updated
+            break
+        location = updated
+
+    density_median, density_upper, density_lower = _influence_density_values(
+        values,
+        (median, median + mad, median - mad),
+        method=density_method,
+        analytic_density=analytic_density,
+        folds=density_folds,
+        seed=density_seed,
+    )
+    median_if = (0.5 - (values <= median).astype(float)) / density_median
+    mad_if = (
+        0.5
+        - (np.abs(values - median) <= mad).astype(float)
+        - (density_upper - density_lower) * median_if
+    ) / (density_upper + density_lower)
+    scale_if = 1.4826 * mad_if
+
+    residual = (values - location) / scale
+    active = (np.abs(residual) < huber_c).astype(float)
+    sensitivity = float(np.mean(active))
+    scale_coupling = float(np.mean(residual * active))
+    if sensitivity <= 0.0:
+        raise ValueError("Huber influence is undetermined")
+    psi = np.clip(residual, -huber_c, huber_c)
+    location_if = (
+        scale / sensitivity * psi
+        - scale_coupling / sensitivity * scale_if
+    )
+    return location, scale, location_if
+
+
+def huber_profile_correlation_inference(
+    x: Array | list[float],
+    y: Array | list[float],
+    *,
+    huber_c: float = 1.345,
+    alpha: float = 0.05,
+    null_value: float = 0.0,
+    alternative: str = "two-sided",
+    density_method: str = "kde",
+    analytic_density_x: Callable[[float], float] | None = None,
+    analytic_density_y: Callable[[float], float] | None = None,
+    density_folds: int = 5,
+    density_seed: int = 2026081401,
+    small_sample_correction: str = "sample",
+    effective_parameters: int = 6,
+) -> dict[str, float | Array | dict[str, float]]:
+    """Estimate and test robust-reference profile correlation ``rho_P``.
+
+    The estimand is ``Corr(|X - T_X|, |Y - T_Y|)``, where each marginal
+    reference ``T`` is the median/MAD-scaled Huber location functional.  The
+    returned first-order influence function includes the indirect MAD path
+    through each fitted Huber location.  Marginal MAD scaling is not applied to
+    the final profiles because separate positive scales cancel from Pearson
+    correlation.
+
+    This is pointwise Wald inference for a fixed regular IID law, not a uniform
+    guarantee near weakly identified or multimodal reference fits.  The robust
+    references limit marginal location influence; they do not make ``rho_P`` a
+    globally robust correlation coefficient.
+    """
+    x_arr = _as_1d(x, "x")
+    y_arr = _as_1d(y, "y")
+    if x_arr.size != y_arr.size:
+        raise ValueError("x and y must have the same length")
+    if x_arr.size < 12:
+        raise ValueError("x and y must contain at least 12 paired observations")
+    if huber_c <= 0.0:
+        raise ValueError("huber_c must be positive")
+    if not 0.0 < alpha < 1.0:
+        raise ValueError("alpha must be between zero and one")
+    if not -1.0 <= null_value <= 1.0:
+        raise ValueError("null_value must be between -1 and 1")
+    if alternative not in {"greater", "less", "two-sided"}:
+        raise ValueError("alternative must be 'greater', 'less', or 'two-sided'")
+    if small_sample_correction not in {"hc0", "sample", "hc1"}:
+        raise ValueError("small_sample_correction must be 'hc0', 'sample', or 'hc1'")
+    if effective_parameters < 1:
+        raise ValueError("effective_parameters must be positive")
+    if small_sample_correction == "hc1" and effective_parameters >= x_arr.size:
+        raise ValueError("effective_parameters must be between 1 and n - 1")
+
+    tx, scale_x, location_if_x = _huber_location_influence(
+        x_arr,
+        huber_c=huber_c,
+        density_method=density_method,
+        analytic_density=analytic_density_x,
+        density_folds=density_folds,
+        density_seed=density_seed,
+    )
+    ty, scale_y, location_if_y = _huber_location_influence(
+        y_arr,
+        huber_c=huber_c,
+        density_method=density_method,
+        analytic_density=analytic_density_y,
+        density_folds=density_folds,
+        density_seed=density_seed + 1,
+    )
+
+    profile_x = np.abs(x_arr - tx)
+    profile_y = np.abs(y_arr - ty)
+    moments = np.asarray(
+        (
+            np.mean(profile_x * profile_y),
+            np.mean(profile_x),
+            np.mean(profile_y),
+            np.mean(profile_x**2),
+            np.mean(profile_y**2),
+        )
+    )
+    mean_x, mean_y = float(moments[1]), float(moments[2])
+    variance_x = float(moments[3] - mean_x**2)
+    variance_y = float(moments[4] - mean_y**2)
+    if variance_x <= 0.0 or variance_y <= 0.0:
+        raise ValueError("profile correlation is undetermined for a degenerate margin")
+    covariance = float(moments[0] - mean_x * mean_y)
+    denominator = float(np.sqrt(variance_x * variance_y))
+    estimate = covariance / denominator
+    gradient = np.asarray(
+        (
+            1.0 / denominator,
+            -mean_y / denominator + estimate * mean_x / variance_x,
+            -mean_x / denominator + estimate * mean_y / variance_y,
+            -0.5 * estimate / variance_x,
+            -0.5 * estimate / variance_y,
+        )
+    )
+    direct_moment_if = np.column_stack(
+        (
+            profile_x * profile_y,
+            profile_x,
+            profile_y,
+            profile_x**2,
+            profile_y**2,
+        )
+    ) - moments
+    direct_if = direct_moment_if @ gradient
+
+    sign_x = np.sign(x_arr - tx)
+    sign_y = np.sign(y_arr - ty)
+    covariance_tx = -float(np.mean(sign_x * profile_y)) + float(
+        np.mean(sign_x)
+    ) * mean_y
+    covariance_ty = -float(np.mean(profile_x * sign_y)) + mean_x * float(
+        np.mean(sign_y)
+    )
+    variance_tx = -2.0 * float(np.mean(x_arr - tx)) + 2.0 * mean_x * float(
+        np.mean(sign_x)
+    )
+    variance_ty = -2.0 * float(np.mean(y_arr - ty)) + 2.0 * mean_y * float(
+        np.mean(sign_y)
+    )
+    coefficient_x = (
+        covariance_tx / denominator - 0.5 * estimate * variance_tx / variance_x
+    )
+    coefficient_y = (
+        covariance_ty / denominator - 0.5 * estimate * variance_ty / variance_y
+    )
+    influence = (
+        direct_if
+        + coefficient_x * location_if_x
+        + coefficient_y * location_if_y
+    )
+    influence -= float(np.mean(influence))
+
+    correction_factors = {
+        "hc0": 1.0,
+        "sample": x_arr.size / (x_arr.size - 1.0),
+        "hc1": x_arr.size / (x_arr.size - effective_parameters),
+    }
+    correction_factor = correction_factors[small_sample_correction]
+    influence_variance = float(np.mean(influence**2) * correction_factor)
+    standard_error = float(np.sqrt(influence_variance / x_arr.size))
+    if standard_error <= 0.0:
+        raise ValueError("profile correlation standard error is degenerate")
+
+    z_statistic = float((estimate - null_value) / standard_error)
+    normal = NormalDist()
+    if alternative == "greater":
+        p_value = 1.0 - normal.cdf(z_statistic)
+    elif alternative == "less":
+        p_value = normal.cdf(z_statistic)
+    else:
+        p_value = 2.0 * (1.0 - normal.cdf(abs(z_statistic)))
+    z_critical = normal.inv_cdf(1.0 - alpha / 2.0)
+
+    return {
+        "estimate": float(estimate),
+        "standard_error": standard_error,
+        "normal": {
+            "lower": float(estimate - z_critical * standard_error),
+            "upper": float(estimate + z_critical * standard_error),
+        },
+        "z_statistic": z_statistic,
+        "p_value": float(p_value),
+        "influence_variance": influence_variance,
+        "location_coefficient_x": float(coefficient_x),
+        "location_coefficient_y": float(coefficient_y),
+        "influence": influence,
+        "reference_location_x": float(tx),
+        "reference_location_y": float(ty),
+        "reference_scale_x": float(scale_x),
+        "reference_scale_y": float(scale_y),
+        "variance_correction_factor": float(correction_factor),
+    }
+
+
+def huber_cdelta_influence_inference(
+    x: Array | list[float],
+    y: Array | list[float],
+    *,
+    huber_c: float = 1.345,
+    alpha: float = 0.05,
+    null_value: float = 1.0,
+    alternative: str = "greater",
+    density_method: str = "kde",
+    analytic_density_x: Callable[[float], float] | None = None,
+    analytic_density_y: Callable[[float], float] | None = None,
+    density_folds: int = 5,
+    density_seed: int = 20260919,
+    small_sample_correction: str = "sample",
+    effective_parameters: int = 9,
+) -> dict[str, float | dict[str, float]]:
+    """Return full plug-in sandwich inference for uncapped Huber c_delta.
+
+    This implements the paired influence function for the numerator and both
+    denominator moments, including the MAD-to-Huber-centre nuisance path.
+    Ordinary KDE, cross-fitted KDE, or supplied analytic densities can provide
+    the three marginal density values required by the median and MAD influence
+    functions.  HC options are scalar finite-sample analogues rather than
+    leverage-specific regression corrections.  The result is a first-order,
+    continuous-distribution procedure and is not covered for tied or nearly
+    degenerate margins.  Permutation inference is finite-sample exact only
+    under a separately declared group-invariance null; it is not an automatic
+    remedy for an arbitrary weak null.
+    """
+    x_arr = _as_1d(x, "x")
+    y_arr = _as_1d(y, "y")
+    if x_arr.size != y_arr.size:
+        raise ValueError("x and y must have the same length")
+    if huber_c <= 0.0:
+        raise ValueError("huber_c must be positive")
+    if not 0.0 < alpha < 1.0:
+        raise ValueError("alpha must be between zero and one")
+    if null_value <= 0.0:
+        raise ValueError("null_value must be positive")
+    if alternative not in {"greater", "less", "two-sided"}:
+        raise ValueError("alternative must be 'greater', 'less', or 'two-sided'")
+    if small_sample_correction not in {"hc0", "sample", "hc1", "hc3"}:
+        raise ValueError(
+            "small_sample_correction must be 'hc0', 'sample', 'hc1', or 'hc3'"
+        )
+    if effective_parameters < 1:
+        raise ValueError("effective_parameters must be positive")
+    if (
+        small_sample_correction in {"hc1", "hc3"}
+        and effective_parameters >= x_arr.size
+    ):
+        raise ValueError("effective_parameters must be between 1 and n - 1")
+
+    tx, _, location_if_x = _huber_location_influence(
+        x_arr,
+        huber_c=huber_c,
+        density_method=density_method,
+        analytic_density=analytic_density_x,
+        density_folds=density_folds,
+        density_seed=density_seed,
+    )
+    ty, _, location_if_y = _huber_location_influence(
+        y_arr,
+        huber_c=huber_c,
+        density_method=density_method,
+        analytic_density=analytic_density_y,
+        density_folds=density_folds,
+        density_seed=density_seed + 1,
+    )
+    ax, ay = np.abs(x_arr - tx), np.abs(y_arr - ty)
+    mean_x, mean_y = float(np.mean(ax)), float(np.mean(ay))
+    if mean_x <= 0.0 or mean_y <= 0.0:
+        raise ValueError("c_delta influence is undetermined")
+    cross = float(np.mean(ax * ay))
+    estimate = cross / (mean_x * mean_y)
+
+    sign_x, sign_y = np.sign(x_arr - tx), np.sign(y_arr - ty)
+    direct = (
+        ax * ay / (mean_x * mean_y)
+        - estimate * ax / mean_x
+        - estimate * ay / mean_y
+        + estimate
+    )
+    coefficient_x = (
+        estimate * float(np.mean(sign_x)) / mean_x
+        - float(np.mean(sign_x * ay)) / (mean_x * mean_y)
+    )
+    coefficient_y = (
+        estimate * float(np.mean(sign_y)) / mean_y
+        - float(np.mean(ax * sign_y)) / (mean_x * mean_y)
+    )
+    influence = (
+        direct
+        + coefficient_x * location_if_x
+        + coefficient_y * location_if_y
+    )
+    influence -= float(np.mean(influence))
+    correction_factors = {
+        "hc0": 1.0,
+        "sample": x_arr.size / (x_arr.size - 1.0),
+        "hc1": x_arr.size / (x_arr.size - effective_parameters),
+        "hc3": (x_arr.size / (x_arr.size - effective_parameters)) ** 2,
+    }
+    correction_factor = correction_factors[small_sample_correction]
+    influence_variance = float(np.mean(influence**2) * correction_factor)
+    standard_error = float(np.sqrt(influence_variance / x_arr.size))
+    z_critical = NormalDist().inv_cdf(1.0 - alpha / 2.0)
+    normal_interval = {
+        "lower": float(estimate - z_critical * standard_error),
+        "upper": float(estimate + z_critical * standard_error),
+    }
+    log_standard_error = standard_error / estimate
+    log_interval = {
+        "lower": float(np.exp(np.log(estimate) - z_critical * log_standard_error)),
+        "upper": float(np.exp(np.log(estimate) + z_critical * log_standard_error)),
+    }
+    z_statistic = float((estimate - null_value) / standard_error)
+    normal = NormalDist()
+    if alternative == "greater":
+        p_value = 1.0 - normal.cdf(z_statistic)
+    elif alternative == "less":
+        p_value = normal.cdf(z_statistic)
+    else:
+        p_value = 2.0 * (1.0 - normal.cdf(abs(z_statistic)))
+    return {
+        "estimate": estimate,
+        "influence_variance": influence_variance,
+        "standard_error": standard_error,
+        "normal": normal_interval,
+        "log_normal": log_interval,
+        "z_statistic": z_statistic,
+        "p_value": float(p_value),
+        "direct_variance": float(np.var(direct, ddof=1)),
+        "location_coefficient_x": coefficient_x,
+        "location_coefficient_y": coefficient_y,
+        "variance_correction_factor": correction_factor,
+    }
+
+
+def huber_cdelta_bootstrap_t_interval(
+    x: Array | list[float],
+    y: Array | list[float],
+    *,
+    n_boot: int = 399,
+    seed: int = 20260920,
+    huber_c: float = 1.345,
+    alpha: float = 0.05,
+    density_method: str = "kde",
+    density_folds: int = 5,
+    small_sample_correction: str = "sample",
+) -> dict[str, float | dict[str, float]]:
+    """Return full-refit bootstrap-t intervals using the complete IF SE.
+
+    Both the statistic and its sandwich standard error are recomputed in each
+    paired bootstrap sample.  Analytic-density mode is intentionally excluded
+    because a bootstrap procedure should not require knowledge of the data-
+    generating density.
+    """
+    x_arr = _as_1d(x, "x")
+    y_arr = _as_1d(y, "y")
+    if x_arr.size != y_arr.size:
+        raise ValueError("x and y must have the same length")
+    if n_boot < 39:
+        raise ValueError("n_boot must be at least 39")
+    if density_method == "analytic":
+        raise ValueError("bootstrap-t does not support analytic density")
+
+    observed = huber_cdelta_influence_inference(
+        x_arr,
+        y_arr,
+        huber_c=huber_c,
+        alpha=alpha,
+        density_method=density_method,
+        density_folds=density_folds,
+        density_seed=seed,
+        small_sample_correction=small_sample_correction,
+    )
+    estimate = float(observed["estimate"])
+    standard_error = float(observed["standard_error"])
+    rng = np.random.default_rng(seed)
+    pivots, log_pivots = [], []
+    for bootstrap_index in range(n_boot):
+        indices = rng.integers(0, x_arr.size, size=x_arr.size)
+        try:
+            fitted = huber_cdelta_influence_inference(
+                x_arr[indices],
+                y_arr[indices],
+                huber_c=huber_c,
+                alpha=alpha,
+                density_method=density_method,
+                density_folds=density_folds,
+                density_seed=seed + bootstrap_index + 1,
+                small_sample_correction=small_sample_correction,
+            )
+        except ValueError:
+            continue
+        bootstrap_estimate = float(fitted["estimate"])
+        bootstrap_se = float(fitted["standard_error"])
+        if bootstrap_se <= 0.0 or bootstrap_estimate <= 0.0:
+            continue
+        pivots.append((bootstrap_estimate - estimate) / bootstrap_se)
+        log_pivots.append(
+            (np.log(bootstrap_estimate) - np.log(estimate))
+            / (bootstrap_se / bootstrap_estimate)
+        )
+    if len(pivots) < max(30, int(0.8 * n_boot)):
+        raise ValueError("too few valid bootstrap-t replicates")
+
+    probabilities = (alpha / 2.0, 1.0 - alpha / 2.0)
+    pivot_low, pivot_high = np.quantile(pivots, probabilities)
+    log_low, log_high = np.quantile(log_pivots, probabilities)
+    log_se = standard_error / estimate
+    return {
+        "estimate": estimate,
+        "standard_error": standard_error,
+        "normal_scale": {
+            "lower": float(estimate - pivot_high * standard_error),
+            "upper": float(estimate - pivot_low * standard_error),
+        },
+        "log_scale": {
+            "lower": float(np.exp(np.log(estimate) - log_high * log_se)),
+            "upper": float(np.exp(np.log(estimate) - log_low * log_se)),
+        },
+        "n_boot_used": float(len(pivots)),
+    }
+
+
+def huber_cdelta_jackknife_inference(
+    x: Array | list[float],
+    y: Array | list[float],
+    *,
+    huber_c: float = 1.345,
+    cap: float | None = None,
+    alpha: float = 0.05,
+) -> dict[str, float | dict[str, float]]:
+    """Return full-refit jackknife SE and normal/log-normal intervals."""
+    x_arr = _as_1d(x, "x")
+    y_arr = _as_1d(y, "y")
+    if x_arr.size != y_arr.size:
+        raise ValueError("x and y must have the same length")
+    if x_arr.size < 4:
+        raise ValueError("at least four pairs are required for jackknife inference")
+    if not 0.0 < alpha < 1.0:
+        raise ValueError("alpha must be between zero and one")
+
+    def estimate(x_values: Array, y_values: Array) -> float:
+        value = c_delta_from_profiles(
+            huber_reference_profile(x_values, huber_c=huber_c, cap=cap),
+            huber_reference_profile(y_values, huber_c=huber_c, cap=cap),
+        )["raw"]
+        return float(value)
+
+    observed = estimate(x_arr, y_arr)
+    if not np.isfinite(observed) or observed <= 0.0:
+        raise ValueError("observed Huber c_delta is undetermined")
+    leave_one_out = []
+    for omitted in range(x_arr.size):
+        keep = np.arange(x_arr.size) != omitted
+        value = estimate(x_arr[keep], y_arr[keep])
+        if not np.isfinite(value):
+            raise ValueError("a jackknife sample was undetermined")
+        leave_one_out.append(value)
+    jackknife = np.asarray(leave_one_out)
+    standard_error = float(
+        np.sqrt((x_arr.size - 1) / x_arr.size * np.sum((jackknife - jackknife.mean()) ** 2))
+    )
+    z = NormalDist().inv_cdf(1.0 - alpha / 2.0)
+    normal_interval = {
+        "lower": float(observed - z * standard_error),
+        "upper": float(observed + z * standard_error),
+    }
+    log_standard_error = standard_error / observed
+    log_interval = {
+        "lower": float(np.exp(np.log(observed) - z * log_standard_error)),
+        "upper": float(np.exp(np.log(observed) + z * log_standard_error)),
+    }
+    return {
+        "estimate": observed,
+        "standard_error": standard_error,
+        "normal": normal_interval,
+        "log_normal": log_interval,
+    }
+
+
+def symmetric_lognormal_cdelta_moments(
+    latent_correlation: float, *, log_scale: float = 0.45
+) -> dict[str, float]:
+    """Return analytic c_delta and IF variance for symmetric lognormal radii."""
+    if not -1.0 <= latent_correlation <= 1.0:
+        raise ValueError("latent_correlation must be between -1 and 1")
+    if log_scale <= 0.0:
+        raise ValueError("log_scale must be positive")
+    t = log_scale**2
+    rho = latent_correlation
+    c_delta_value = float(np.exp(t * rho))
+    influence_variance = float(
+        np.exp(2.0 * t + 4.0 * t * rho)
+        + 2.0 * np.exp(t + 2.0 * t * rho)
+        - 4.0 * np.exp(t + 3.0 * t * rho)
+        + 2.0 * np.exp(3.0 * t * rho)
+        - np.exp(2.0 * t * rho)
+    )
+    return {
+        "c_delta": c_delta_value,
+        "influence_variance": influence_variance,
+    }
+
+
+def c_delta_identity_from_divergences(dx: Array, dy: Array) -> dict[str, float]:
+    """Return the algebraic decomposition of corrected c_delta.
+
+    With population-standard-deviation conventions,
+
+        c_delta = 1 + corr(D_x, D_y) * CV(D_x) * CV(D_y).
+
+    The same positive CV product is fixed across permutations of ``dy``.
+    """
+    dx_arr = _as_1d(dx, "dx")
+    dy_arr = _as_1d(dy, "dy")
+    if dx_arr.size != dy_arr.size:
+        raise ValueError("dx and dy must have the same length")
+
+    mean_dx = float(dx_arr.mean())
+    mean_dy = float(dy_arr.mean())
+    sd_dx = float(dx_arr.std(ddof=0))
+    sd_dy = float(dy_arr.std(ddof=0))
+    if mean_dx == 0.0 or mean_dy == 0.0 or sd_dx == 0.0 or sd_dy == 0.0:
+        message = "undetermined due to data limitations"
+        return {
+            "c_delta": np.nan,
+            "correlation": np.nan,
+            "cv_product": np.nan,
+            "identity_value": np.nan,
+            "absolute_error": np.nan,
+            "status": message,
+        }
+
+    raw = _raw_from_divergences(dx_arr, dy_arr)
+    correlation = float(np.corrcoef(dx_arr, dy_arr)[0, 1])
+    cv_product = (sd_dx / mean_dx) * (sd_dy / mean_dy)
+    identity_value = 1.0 + correlation * cv_product
+    return {
+        "c_delta": raw,
+        "correlation": correlation,
+        "cv_product": cv_product,
+        "identity_value": identity_value,
+        "absolute_error": abs(raw - identity_value),
+        "status": "ok",
+    }
+
+
+def permutation_statistics_from_divergences(
+    dx: Array,
+    dy: Array,
+    *,
+    n_perm: int = 999,
+    seed: int | None = None,
+) -> Array:
+    """Sample raw c_delta values by permuting an existing divergence vector."""
+    rng = np.random.default_rng(seed)
+    return np.asarray(
+        [_raw_from_divergences(dx, rng.permutation(dy)) for _ in range(n_perm)],
+        dtype=float,
+    )
+
+
+def exact_permutation_statistics_from_divergences(dx: Array, dy: Array) -> Array:
+    """Enumerate all raw c_delta values for small n."""
+    if dx.size > 9:
+        raise ValueError("exact enumeration is intended only for small n")
+    return np.asarray(
+        [_raw_from_divergences(dx, dy[list(order)]) for order in permutations(range(dx.size))],
+        dtype=float,
+    )
+
+
+def permutation_test(
+    x: Array | list[float],
+    y: Array | list[float],
+    *,
+    n_perm: int = 999,
+    seed: int | None = None,
+    kind: str = "l2",
+    alternative: str = "greater",
+) -> dict[str, float | str]:
+    """Permutation test for paired divergence-salience alignment.
+
+    ``greater`` tests positive salience alignment, ``less`` tests negative
+    alignment, and ``two-sided`` tests either direction around the exact
+    permutation anchor of 1. The default preserves the original behavior.
+    """
+    if alternative not in {"greater", "less", "two-sided"}:
+        raise ValueError("alternative must be 'greater', 'less', or 'two-sided'")
+    rng = np.random.default_rng(seed)
+    x_arr = _as_1d(x, "x")
+    y_arr = _as_1d(y, "y")
+    if x_arr.size != y_arr.size:
+        raise ValueError("x and y must have the same length")
+
+    dx = divergence_vector(x_arr, kind=kind)
+    dy = divergence_vector(y_arr, kind=kind)
+    observed = _raw_from_divergences(dx, dy)
+    if np.isnan(observed):
+        return {
+            "observed": np.nan,
+            "p_value": np.nan,
+            "alternative": alternative,
+            "status": "undetermined due to data limitations",
+        }
+
+    exceed = 0
+
+    for _ in range(n_perm):
+        stat = _raw_from_divergences(dx, rng.permutation(dy))
+        if alternative == "greater":
+            exceed += stat >= observed
+        elif alternative == "less":
+            exceed += stat <= observed
+        else:
+            exceed += abs(stat - 1.0) >= abs(observed - 1.0)
+
+    p_value = (exceed + 1) / (n_perm + 1)
+    return {
+        "observed": observed,
+        "p_value": float(p_value),
+        "alternative": alternative,
+        "status": "ok",
+    }
+
+
+def permutation_mean_check(
+    x: Array | list[float],
+    y: Array | list[float],
+    *,
+    n_perm: int = 5000,
+    seed: int | None = None,
+    kind: str = "l2",
+    exact: bool = False,
+) -> dict[str, float | str]:
+    """Check that the mean raw c_delta over permutations is approximately 1."""
+    x_arr = _as_1d(x, "x")
+    y_arr = _as_1d(y, "y")
+    if x_arr.size != y_arr.size:
+        raise ValueError("x and y must have the same length")
+
+    dx = divergence_vector(x_arr, kind=kind)
+    dy = divergence_vector(y_arr, kind=kind)
+    if exact:
+        stats = exact_permutation_statistics_from_divergences(dx, dy)
+        method = "exact"
+    else:
+        stats = permutation_statistics_from_divergences(
+            dx, dy, n_perm=n_perm, seed=seed
+        )
+        method = "monte_carlo"
+
+    return {
+        "n": x_arr.size,
+        "method": method,
+        "n_statistics": stats.size,
+        "mean_permuted_raw": round(float(np.mean(stats)), 6),
+        "expected_mean": 1.0,
+        "absolute_error": round(abs(float(np.mean(stats)) - 1.0), 6),
+    }
+
+
+def bootstrap_ci(
+    x: Array | list[float],
+    y: Array | list[float],
+    *,
+    n_boot: int = 1000,
+    seed: int | None = None,
+    alpha: float = 0.05,
+    kind: str = "l2",
+) -> dict[str, float]:
+    """Percentile paired bootstrap interval for raw c_delta."""
+    rng = np.random.default_rng(seed)
+    x_arr = _as_1d(x, "x")
+    y_arr = _as_1d(y, "y")
+    if x_arr.size != y_arr.size:
+        raise ValueError("x and y must have the same length")
+
+    stats = []
+    for _ in range(n_boot):
+        idx = rng.integers(0, x_arr.size, size=x_arr.size)
+        try:
+            stats.append(c_delta(x_arr[idx], y_arr[idx], kind=kind).raw)
+        except ValueError:
+            continue
+
+    if not stats:
+        raise ValueError("all bootstrap samples had zero divergence")
+
+    lower, upper = np.quantile(stats, [alpha / 2, 1 - alpha / 2])
+    return {
+        "estimate": c_delta(x_arr, y_arr, kind=kind).raw,
+        "lower": float(lower),
+        "upper": float(upper),
+        "n_used": float(len(stats)),
+    }
+
+
+def make_scenario(
+    name: str,
+    n: int,
+    *,
+    seed: int | None = None,
+) -> tuple[Array, Array]:
+    """Generate paired samples for pilot simulations."""
+    rng = np.random.default_rng(seed)
+
+    if name == "null_normal":
+        return rng.normal(size=n), rng.normal(size=n)
+    if name == "aligned_normal":
+        x = rng.normal(size=n)
+        return x, x + rng.normal(scale=0.25, size=n)
+    if name == "inverted_divergence":
+        x = np.linspace(-2.0, 2.0, n) + rng.normal(scale=0.05, size=n)
+        y = -np.abs(x) + rng.normal(scale=0.05, size=n)
+        return x, y
+    if name == "heavy_tailed":
+        return rng.standard_t(df=3, size=n), rng.standard_t(df=3, size=n)
+    if name == "skewed":
+        return rng.lognormal(mean=0.0, sigma=0.8, size=n), rng.lognormal(
+            mean=0.0, sigma=0.8, size=n
+        )
+    if name == "contaminated_aligned":
+        x = rng.normal(size=n)
+        y = x + rng.normal(scale=0.35, size=n)
+        k = max(1, n // 20)
+        idx = rng.choice(n, size=k, replace=False)
+        x[idx] += rng.normal(loc=8.0, scale=1.0, size=k)
+        y[idx] += rng.normal(loc=8.0, scale=1.0, size=k)
+        return x, y
+    if name == "matched_extreme":
+        return make_extreme_scenario(name, n, seed=seed)[:2]
+    if name == "mismatched_extreme":
+        return make_extreme_scenario(name, n, seed=seed)[:2]
+    if name == "x_only_extreme":
+        return make_extreme_scenario(name, n, seed=seed)[:2]
+    if name == "y_only_extreme":
+        return make_extreme_scenario(name, n, seed=seed)[:2]
+
+    raise ValueError(f"unknown scenario: {name}")
+
+
+def make_extreme_scenario(
+    name: str,
+    n: int,
+    *,
+    seed: int | None = None,
+    magnitude: float = 8.0,
+    background: str = "normal",
+) -> tuple[Array, Array, list[int]]:
+    """Generate scenarios with retained extreme observations.
+
+    The returned index list identifies observations used for sensitivity
+    exclusion. The main statistical analysis should keep these observations.
+    """
+    if n < 4:
+        raise ValueError("n must be at least four for extreme-value scenarios")
+
+    rng = np.random.default_rng(seed)
+    x = _background_sample(rng, n, background)
+    y = _background_sample(rng, n, background)
+
+    if name == "null_normal":
+        return x, y, []
+    if name == "matched_extreme":
+        x[-1] = magnitude
+        y[-1] = magnitude
+        return x, y, [n - 1]
+    if name == "mismatched_extreme":
+        x[-1] = magnitude
+        y[0] = magnitude
+        return x, y, [0, n - 1]
+    if name == "x_only_extreme":
+        x[-1] = magnitude
+        return x, y, [n - 1]
+    if name == "y_only_extreme":
+        y[-1] = magnitude
+        return x, y, [n - 1]
+
+    raise ValueError(f"unknown extreme scenario: {name}")
+
+
+def make_multi_extreme_scenario(
+    *,
+    n: int,
+    k: int,
+    seed: int | None = None,
+    magnitude: float = 8.0,
+    background: str = "normal",
+    matched: bool = True,
+) -> tuple[Array, Array, list[int]]:
+    """Generate k retained extreme observations.
+
+    With ``matched=True``, the same k paired indices are extreme in x and y. With
+    ``matched=False``, y's extreme indices are shifted away from x's indices,
+    creating an all-star group in both samples but not at the same paired
+    observations.
+    """
+    if k < 1:
+        raise ValueError("k must be at least one")
+    if n < 2 * k + 2:
+        raise ValueError("n must be at least 2 * k + 2 for multi-extreme scenarios")
+
+    rng = np.random.default_rng(seed)
+    x = _background_sample(rng, n, background)
+    y = _background_sample(rng, n, background)
+    x_idx = np.arange(n - k, n)
+
+    if matched:
+        y_idx = x_idx
+    else:
+        y_idx = np.arange(0, k)
+
+    x[x_idx] = magnitude
+    y[y_idx] = magnitude
+    return x, y, sorted(set(x_idx.tolist() + y_idx.tolist()))
+
+
+def make_independent_extreme_scenario(
+    *,
+    n: int,
+    k: int,
+    seed: int | None = None,
+    magnitude: float = 8.0,
+    background: str = "normal",
+) -> tuple[Array, Array, list[int], list[int]]:
+    """Generate independent extreme index sets for Type-I calibration."""
+    if k < 1:
+        raise ValueError("k must be at least one")
+    if n < k + 2:
+        raise ValueError("n must be at least k + 2")
+
+    rng = np.random.default_rng(seed)
+    x = _background_sample(rng, n, background)
+    y = _background_sample(rng, n, background)
+    x_idx = np.sort(rng.choice(n, size=k, replace=False))
+    y_idx = np.sort(rng.choice(n, size=k, replace=False))
+    x[x_idx] = magnitude
+    y[y_idx] = magnitude
+    return x, y, x_idx.tolist(), y_idx.tolist()
+
+
+def _overlap_count(permuted_y_extreme_indices: Array, x_extreme_indices: set[int]) -> int:
+    return sum(int(idx in x_extreme_indices) for idx in permuted_y_extreme_indices)
+
+
+def _drop_indices(x: Array, y: Array, indices: list[int]) -> tuple[Array, Array]:
+    if not indices:
+        return x, y
+    mask = np.ones(x.size, dtype=bool)
+    mask[indices] = False
+    return x[mask], y[mask]
+
+
+def _wilson_interval(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Approximate 95% Wilson interval for a binomial proportion."""
+    if n == 0:
+        return np.nan, np.nan
+    phat = successes / n
+    denom = 1 + z**2 / n
+    center = (phat + z**2 / (2 * n)) / denom
+    half_width = z * np.sqrt((phat * (1 - phat) + z**2 / (4 * n)) / n) / denom
+    return center - half_width, center + half_width
+
+
+def outlier_influence_summary(
+    *,
+    n: int = 40,
+    seed: int = 123,
+    n_perm: int = 499,
+    background: str = "normal",
+) -> list[dict[str, float | str]]:
+    """Compare retained and sensitivity-excluded extreme observations.
+
+    The main analysis keeps the extreme value. Exclusion is reported only as a
+    sensitivity comparison because the extreme value may define the group's
+    divergence structure.
+    """
+    rows = []
+    scenarios = [
+        "null_normal",
+        "matched_extreme",
+        "mismatched_extreme",
+        "x_only_extreme",
+        "y_only_extreme",
+    ]
+    for offset, scenario in enumerate(scenarios):
+        x, y, extreme_indices = make_extreme_scenario(
+            scenario, n, seed=seed + offset, background=background
+        )
+        kept = c_delta(x, y)
+        kept_perm = permutation_test(
+            x, y, n_perm=n_perm, seed=seed + 1000 + offset
+        )
+        sensitivity_x, sensitivity_y = _drop_indices(x, y, extreme_indices)
+        excluded = c_delta(sensitivity_x, sensitivity_y)
+        rows.append(
+            {
+                "scenario": scenario,
+                "main_raw": round(kept.raw, 4),
+                "main_norm": round(kept.normalized_pairing, 4),
+                "main_corr": round(kept.direction_correlation, 4),
+                "main_perm_p": round(kept_perm["p_value"], 4),
+                "sensitivity_raw_without_extreme_indices": round(excluded.raw, 4),
+                "raw_change": round(kept.raw - excluded.raw, 4),
+            }
+        )
+    return rows
+
+
+def repeated_outlier_simulation(
+    *,
+    n: int = 40,
+    repetitions: int = 300,
+    n_perm: int = 99,
+    seed: int = 123,
+    magnitude: float = 8.0,
+    background: str = "normal",
+    alpha: float = 0.05,
+) -> list[dict[str, float | str]]:
+    """Repeated simulation for matched and unmatched extreme observations."""
+    scenarios = [
+        "null_normal",
+        "matched_extreme",
+        "mismatched_extreme",
+        "x_only_extreme",
+        "y_only_extreme",
+    ]
+    accum: dict[str, list[dict[str, float]]] = {scenario: [] for scenario in scenarios}
+
+    for rep in range(repetitions):
+        for scenario_offset, scenario in enumerate(scenarios):
+            scenario_seed = seed + rep * 100 + scenario_offset
+            x, y, extreme_indices = make_extreme_scenario(
+                scenario,
+                n,
+                seed=scenario_seed,
+                magnitude=magnitude,
+                background=background,
+            )
+            kept = c_delta(x, y)
+            perm = permutation_test(
+                x,
+                y,
+                n_perm=n_perm,
+                seed=seed + 1_000_000 + rep * 100 + scenario_offset,
+            )
+            sensitivity_x, sensitivity_y = _drop_indices(x, y, extreme_indices)
+            excluded = c_delta(sensitivity_x, sensitivity_y)
+            accum[scenario].append(
+                {
+                    "raw": kept.raw,
+                    "norm": kept.normalized_pairing,
+                    "corr": kept.direction_correlation,
+                    "p": perm["p_value"],
+                    "reject": float(perm["p_value"] < alpha),
+                    "raw_change": kept.raw - excluded.raw,
+                }
+            )
+
+    rows = []
+    for scenario in scenarios:
+        values = accum[scenario]
+        rows.append(
+            {
+                "scenario": scenario,
+                "repetitions": repetitions,
+                "magnitude": magnitude,
+                "background": background,
+                "alpha": alpha,
+                "mean_raw": round(float(np.mean([v["raw"] for v in values])), 4),
+                "sd_raw": round(float(np.std([v["raw"] for v in values], ddof=1)), 4),
+                "mean_norm": round(float(np.mean([v["norm"] for v in values])), 4),
+                "mean_corr": round(float(np.mean([v["corr"] for v in values])), 4),
+                "rejection_rate": round(
+                    float(np.mean([v["reject"] for v in values])), 4
+                ),
+                "mean_raw_change": round(
+                    float(np.mean([v["raw_change"] for v in values])), 4
+                ),
+            }
+        )
+    return rows
+
+
+def magnitude_grid_simulation(
+    *,
+    n: int = 40,
+    repetitions: int = 200,
+    n_perm: int = 99,
+    seed: int = 123,
+    magnitudes: list[float] | None = None,
+    background: str = "normal",
+    alpha: float = 0.05,
+) -> list[dict[str, float | str]]:
+    """Track when a matched extreme value begins to define structure."""
+    if magnitudes is None:
+        magnitudes = [0.0, 2.0, 4.0, 6.0, 8.0, 10.0]
+
+    rows = []
+    for mag_offset, magnitude in enumerate(magnitudes):
+        values = []
+        for rep in range(repetitions):
+            x, y, extreme_indices = make_extreme_scenario(
+                "matched_extreme",
+                n,
+                seed=seed + mag_offset * 10_000 + rep,
+                magnitude=magnitude,
+                background=background,
+            )
+            kept = c_delta(x, y)
+            perm = permutation_test(
+                x,
+                y,
+                n_perm=n_perm,
+                seed=seed + 2_000_000 + mag_offset * 10_000 + rep,
+            )
+            sensitivity_x, sensitivity_y = _drop_indices(x, y, extreme_indices)
+            excluded = c_delta(sensitivity_x, sensitivity_y)
+            values.append(
+                {
+                    "raw": kept.raw,
+                    "corr": kept.direction_correlation,
+                    "reject": float(perm["p_value"] < alpha),
+                    "raw_change": kept.raw - excluded.raw,
+                }
+            )
+        rows.append(
+            {
+                "scenario": "matched_extreme",
+                "magnitude": magnitude,
+                "repetitions": repetitions,
+                "background": background,
+                "alpha": alpha,
+                "mean_raw": round(float(np.mean([v["raw"] for v in values])), 4),
+                "mean_corr": round(float(np.mean([v["corr"] for v in values])), 4),
+                "rejection_rate": round(
+                    float(np.mean([v["reject"] for v in values])), 4
+                ),
+                "mean_raw_change": round(
+                    float(np.mean([v["raw_change"] for v in values])), 4
+                ),
+            }
+        )
+    return rows
+
+
+def power_curve_simulation(
+    *,
+    sample_sizes: list[int] | None = None,
+    magnitudes: list[float] | None = None,
+    repetitions: int = 120,
+    n_perm: int = 199,
+    seed: int = 123,
+    background: str = "normal",
+    alpha: float = 0.05,
+) -> list[dict[str, float | str]]:
+    """Estimate matched-extreme power curves across n and magnitude."""
+    if sample_sizes is None:
+        sample_sizes = [15, 20, 40]
+    if magnitudes is None:
+        magnitudes = [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0]
+
+    rows = []
+    for n_offset, n in enumerate(sample_sizes):
+        for mag_offset, magnitude in enumerate(magnitudes):
+            values = []
+            for rep in range(repetitions):
+                row_seed = seed + n_offset * 100_000 + mag_offset * 10_000 + rep
+                x, y, extreme_indices = make_extreme_scenario(
+                    "matched_extreme",
+                    n,
+                    seed=row_seed,
+                    magnitude=magnitude,
+                    background=background,
+                )
+                kept = c_delta(x, y)
+                perm = permutation_test(
+                    x,
+                    y,
+                    n_perm=n_perm,
+                    seed=seed + 3_000_000 + n_offset * 100_000 + mag_offset * 10_000 + rep,
+                )
+                sensitivity_x, sensitivity_y = _drop_indices(x, y, extreme_indices)
+                excluded = c_delta(sensitivity_x, sensitivity_y)
+                values.append(
+                    {
+                        "raw": kept.raw,
+                        "corr": kept.direction_correlation,
+                        "reject": float(perm["p_value"] < alpha),
+                        "raw_change": kept.raw - excluded.raw,
+                    }
+                )
+            rows.append(
+                {
+                    "n": n,
+                    "magnitude": magnitude,
+                    "background": background,
+                    "alpha": alpha,
+                    "repetitions": repetitions,
+                    "mean_raw": round(float(np.mean([v["raw"] for v in values])), 4),
+                    "mean_corr": round(float(np.mean([v["corr"] for v in values])), 4),
+                    "rejection_rate": round(
+                        float(np.mean([v["reject"] for v in values])), 4
+                    ),
+                    "mean_raw_change": round(
+                        float(np.mean([v["raw_change"] for v in values])), 4
+                    ),
+                }
+            )
+    return rows
+
+
+def background_extreme_simulation(
+    *,
+    backgrounds: list[str] | None = None,
+    scenarios: list[str] | None = None,
+    n: int = 40,
+    magnitude: float = 8.0,
+    repetitions: int = 120,
+    n_perm: int = 199,
+    seed: int = 123,
+    alpha: float = 0.05,
+) -> list[dict[str, float | str]]:
+    """Compare extreme-value alignment under non-normal backgrounds."""
+    if backgrounds is None:
+        backgrounds = ["normal", "t3", "lognormal"]
+    if scenarios is None:
+        scenarios = [
+            "null_normal",
+            "matched_extreme",
+            "mismatched_extreme",
+            "x_only_extreme",
+            "y_only_extreme",
+        ]
+
+    rows = []
+    for bg_offset, background in enumerate(backgrounds):
+        for scenario_offset, scenario in enumerate(scenarios):
+            values = []
+            for rep in range(repetitions):
+                row_seed = seed + bg_offset * 100_000 + scenario_offset * 10_000 + rep
+                x, y, extreme_indices = make_extreme_scenario(
+                    scenario,
+                    n,
+                    seed=row_seed,
+                    magnitude=magnitude,
+                    background=background,
+                )
+                kept = c_delta(x, y)
+                perm = permutation_test(
+                    x,
+                    y,
+                    n_perm=n_perm,
+                    seed=seed + 4_000_000 + bg_offset * 100_000 + scenario_offset * 10_000 + rep,
+                )
+                sensitivity_x, sensitivity_y = _drop_indices(x, y, extreme_indices)
+                excluded = c_delta(sensitivity_x, sensitivity_y)
+                values.append(
+                    {
+                        "raw": kept.raw,
+                        "corr": kept.direction_correlation,
+                        "reject": float(perm["p_value"] < alpha),
+                        "raw_change": kept.raw - excluded.raw,
+                    }
+                )
+            rows.append(
+                {
+                    "background": background,
+                    "scenario": scenario,
+                    "n": n,
+                    "magnitude": magnitude,
+                    "alpha": alpha,
+                    "repetitions": repetitions,
+                    "mean_raw": round(float(np.mean([v["raw"] for v in values])), 4),
+                    "mean_corr": round(float(np.mean([v["corr"] for v in values])), 4),
+                    "rejection_rate": round(
+                        float(np.mean([v["reject"] for v in values])), 4
+                    ),
+                    "mean_raw_change": round(
+                        float(np.mean([v["raw_change"] for v in values])), 4
+                    ),
+                }
+            )
+    return rows
+
+
+def nominal_size_simulation(
+    *,
+    backgrounds: list[str] | None = None,
+    scenarios: list[str] | None = None,
+    n: int = 40,
+    magnitude: float = 8.0,
+    repetitions: int = 200,
+    n_perm: int = 499,
+    seed: int = 123,
+    alphas: list[float] | None = None,
+) -> list[dict[str, float | str]]:
+    """Check empirical size for null and mismatched controls."""
+    if backgrounds is None:
+        backgrounds = ["normal", "t3", "lognormal"]
+    if scenarios is None:
+        scenarios = ["null_normal", "mismatched_extreme"]
+    if alphas is None:
+        alphas = [0.05, 0.01]
+
+    rows = []
+    for bg_offset, background in enumerate(backgrounds):
+        for scenario_offset, scenario in enumerate(scenarios):
+            p_values = []
+            for rep in range(repetitions):
+                row_seed = seed + bg_offset * 100_000 + scenario_offset * 10_000 + rep
+                x, y, _ = make_extreme_scenario(
+                    scenario,
+                    n,
+                    seed=row_seed,
+                    magnitude=magnitude,
+                    background=background,
+                )
+                perm = permutation_test(
+                    x,
+                    y,
+                    n_perm=n_perm,
+                    seed=seed + 5_000_000 + bg_offset * 100_000 + scenario_offset * 10_000 + rep,
+                )
+                p_values.append(perm["p_value"])
+            for alpha in alphas:
+                rows.append(
+                    {
+                        "background": background,
+                        "scenario": scenario,
+                        "n": n,
+                        "magnitude": magnitude,
+                        "alpha": alpha,
+                        "repetitions": repetitions,
+                        "n_perm": n_perm,
+                        "empirical_size": round(
+                            float(np.mean([p < alpha for p in p_values])), 4
+                        ),
+                        "mean_p": round(float(np.mean(p_values)), 4),
+                    }
+                )
+    return rows
+
+
+def multi_extreme_power_simulation(
+    *,
+    sample_sizes: list[int] | None = None,
+    extreme_counts: list[int] | None = None,
+    magnitudes: list[float] | None = None,
+    repetitions: int = 100,
+    n_perm: int = 199,
+    seed: int = 123,
+    background: str = "normal",
+    alpha: float = 0.05,
+) -> list[dict[str, float | str]]:
+    """Estimate power when a small subgroup defines shared structure."""
+    if sample_sizes is None:
+        sample_sizes = [15, 20, 40, 100]
+    if extreme_counts is None:
+        extreme_counts = [1, 2, 3]
+    if magnitudes is None:
+        magnitudes = [4.0, 6.0, 8.0, 10.0]
+
+    rows = []
+    for n_offset, n in enumerate(sample_sizes):
+        for k_offset, k in enumerate(extreme_counts):
+            if n < 2 * k + 2:
+                continue
+            resolution_floor = 1.0 / comb(n, k)
+            for mag_offset, magnitude in enumerate(magnitudes):
+                for matched in [True, False]:
+                    values = []
+                    for rep in range(repetitions):
+                        row_seed = (
+                            seed
+                            + n_offset * 1_000_000
+                            + k_offset * 100_000
+                            + mag_offset * 10_000
+                            + int(matched) * 1_000
+                            + rep
+                        )
+                        x, y, extreme_indices = make_multi_extreme_scenario(
+                            n=n,
+                            k=k,
+                            seed=row_seed,
+                            magnitude=magnitude,
+                            background=background,
+                            matched=matched,
+                        )
+                        kept = c_delta(x, y)
+                        perm = permutation_test(
+                            x,
+                            y,
+                            n_perm=n_perm,
+                            seed=seed + 6_000_000 + row_seed,
+                        )
+                        sensitivity_x, sensitivity_y = _drop_indices(
+                            x, y, extreme_indices
+                        )
+                        excluded = c_delta(sensitivity_x, sensitivity_y)
+                        values.append(
+                            {
+                                "raw": kept.raw,
+                                "corr": kept.direction_correlation,
+                                "reject": float(perm["p_value"] < alpha),
+                                "raw_change": kept.raw - excluded.raw,
+                            }
+                        )
+                    rows.append(
+                        {
+                            "n": n,
+                            "k_extremes": k,
+                            "alignment": "matched" if matched else "mismatched",
+                            "magnitude": magnitude,
+                            "background": background,
+                            "alpha": alpha,
+                            "repetitions": repetitions,
+                            "n_perm": n_perm,
+                            "resolution_floor_approx": round(resolution_floor, 6),
+                            "mean_raw": round(
+                                float(np.mean([v["raw"] for v in values])), 4
+                            ),
+                            "mean_corr": round(
+                                float(np.mean([v["corr"] for v in values])), 4
+                            ),
+                            "rejection_rate": round(
+                                float(np.mean([v["reject"] for v in values])), 4
+                            ),
+                            "mean_raw_change": round(
+                                float(np.mean([v["raw_change"] for v in values])), 4
+                            ),
+                        }
+                    )
+    return rows
+
+
+def near_zero_divergence_simulation(
+    *,
+    epsilons: list[float] | None = None,
+    n: int = 40,
+    seed: int = 123,
+) -> list[dict[str, float | str]]:
+    """Track behavior as empirical divergence scale approaches zero.
+
+    For positive epsilon, c_delta is scale invariant. At exactly zero empirical
+    divergence, the statistic should be reported as undetermined due to data
+    limitations rather than as a numerical error.
+    """
+    if epsilons is None:
+        epsilons = [1.0, 1e-2, 1e-4, 1e-6, 1e-8, 0.0]
+
+    rng = np.random.default_rng(seed)
+    base_x = rng.normal(size=n)
+    base_y = 0.7 * base_x + rng.normal(scale=0.4, size=n)
+    rows = []
+
+    for eps in epsilons:
+        x = eps * base_x
+        y = eps * base_y
+        result = c_delta(x, y)
+        divergence_scale = float(result.dx.mean() * result.dy.mean())
+        rows.append(
+            {
+                "epsilon": eps,
+                "divergence_scale": f"{divergence_scale:.12g}",
+                "raw": "nan" if np.isnan(result.raw) else round(result.raw, 6),
+                "normalized_pairing": (
+                    "nan"
+                    if np.isnan(result.normalized_pairing)
+                    else round(result.normalized_pairing, 6)
+                ),
+                "direction_correlation": (
+                    "nan"
+                    if np.isnan(result.direction_correlation)
+                    else round(result.direction_correlation, 6)
+                ),
+                "status": result.status,
+            }
+        )
+    return rows
+
+
+def large_scale_simulation(
+    *,
+    sample_sizes: list[int] | None = None,
+    extreme_counts: list[int] | None = None,
+    scenarios: list[str] | None = None,
+    backgrounds: list[str] | None = None,
+    repetitions: int = 80,
+    n_perm: int = 499,
+    seed: int = 123,
+    magnitude: float = 8.0,
+    alpha: float = 0.05,
+) -> list[dict[str, float | str]]:
+    """Run larger-n checks using the optimized permutation test."""
+    if sample_sizes is None:
+        sample_sizes = [100, 250, 500]
+    if extreme_counts is None:
+        extreme_counts = [1, 2, 3]
+    if scenarios is None:
+        scenarios = ["matched", "mismatched"]
+    if backgrounds is None:
+        backgrounds = ["normal", "t3", "lognormal"]
+
+    rows = []
+    for bg_offset, background in enumerate(backgrounds):
+        for n_offset, n in enumerate(sample_sizes):
+            for k_offset, k in enumerate(extreme_counts):
+                if n < 2 * k + 2:
+                    continue
+                resolution_floor = 1.0 / comb(n, k)
+                for scenario_offset, scenario in enumerate(scenarios):
+                    matched = scenario == "matched"
+                    values = []
+                    for rep in range(repetitions):
+                        row_seed = (
+                            seed
+                            + bg_offset * 10_000_000
+                            + n_offset * 1_000_000
+                            + k_offset * 100_000
+                            + scenario_offset * 10_000
+                            + rep
+                        )
+                        x, y, _ = make_multi_extreme_scenario(
+                            n=n,
+                            k=k,
+                            seed=row_seed,
+                            magnitude=magnitude,
+                            background=background,
+                            matched=matched,
+                        )
+                        kept = c_delta(x, y)
+                        perm = permutation_test(
+                            x,
+                            y,
+                            n_perm=n_perm,
+                            seed=seed + 7_000_000 + row_seed,
+                        )
+                        values.append(
+                            {
+                                "raw": kept.raw,
+                                "corr": kept.direction_correlation,
+                                "reject": float(perm["p_value"] < alpha),
+                            }
+                        )
+                    rows.append(
+                        {
+                            "background": background,
+                            "n": n,
+                            "k_extremes": k,
+                            "alignment": scenario,
+                            "magnitude": magnitude,
+                            "alpha": alpha,
+                            "repetitions": repetitions,
+                            "n_perm": n_perm,
+                            "resolution_floor_approx": round(resolution_floor, 8),
+                            "mean_raw": round(
+                                float(np.mean([v["raw"] for v in values])), 4
+                            ),
+                            "mean_corr": round(
+                                float(np.mean([v["corr"] for v in values])), 4
+                            ),
+                            "rejection_rate": round(
+                                float(np.mean([v["reject"] for v in values])), 4
+                            ),
+                        }
+                    )
+    return rows
+
+
+def overlap_layer_diagnostic(
+    *,
+    n: int = 15,
+    k: int = 3,
+    magnitude: float = 8.0,
+    n_perm: int = 5000,
+    seed: int = 123,
+    background: str = "normal",
+) -> list[dict[str, float | str]]:
+    """Classify permutation statistics by extreme-index overlap count."""
+    x, y, x_extreme_indices = make_multi_extreme_scenario(
+        n=n,
+        k=k,
+        seed=seed,
+        magnitude=magnitude,
+        background=background,
+        matched=True,
+    )
+    y_extreme_original = np.asarray(x_extreme_indices, dtype=int)
+    x_extreme_set = set(x_extreme_indices)
+    dx = divergence_vector(x)
+    dy = divergence_vector(y)
+    observed = _raw_from_divergences(dx, dy)
+    rng = np.random.default_rng(seed + 1_000_000)
+
+    by_overlap: dict[int, list[float]] = {j: [] for j in range(k + 1)}
+    for _ in range(n_perm):
+        order = rng.permutation(n)
+        stat = _raw_from_divergences(dx, dy[order])
+        # dy[order][i] means original y index order[i] is assigned to x index i.
+        assigned_positions = np.where(np.isin(order, y_extreme_original))[0]
+        overlap = _overlap_count(assigned_positions, x_extreme_set)
+        by_overlap[overlap].append(stat)
+
+    rows = []
+    for overlap in range(k + 1):
+        stats = np.asarray(by_overlap[overlap], dtype=float)
+        rows.append(
+            {
+                "n": n,
+                "k_extremes": k,
+                "magnitude": magnitude,
+                "overlap_count": overlap,
+                "n_permutations": int(stats.size),
+                "layer_probability": round(float(stats.size / n_perm), 6),
+                "mean_stat": "nan" if stats.size == 0 else round(float(stats.mean()), 6),
+                "p95_stat": "nan" if stats.size == 0 else round(float(np.quantile(stats, 0.95)), 6),
+                "max_stat": "nan" if stats.size == 0 else round(float(stats.max()), 6),
+                "observed_stat": round(float(observed), 6),
+                "share_ge_observed": (
+                    "nan"
+                    if stats.size == 0
+                    else round(float(np.mean(stats >= observed)), 6)
+                ),
+            }
+        )
+    return rows
+
+
+def independent_null_size_simulation(
+    *,
+    n: int = 40,
+    k: int = 2,
+    magnitude: float = 8.0,
+    repetitions: int = 200,
+    n_perm: int = 499,
+    seed: int = 123,
+    background: str = "normal",
+    kind: str = "l2",
+    alphas: list[float] | None = None,
+) -> list[dict[str, float | str]]:
+    """Type-I calibration with independently generated extreme index sets."""
+    if alphas is None:
+        alphas = [0.05, 0.01]
+    p_values = []
+    overlaps = []
+    for rep in range(repetitions):
+        x, y, x_idx, y_idx = make_independent_extreme_scenario(
+            n=n,
+            k=k,
+            seed=seed + rep,
+            magnitude=magnitude,
+            background=background,
+        )
+        perm = permutation_test(
+            x,
+            y,
+            n_perm=n_perm,
+            seed=seed + 1_000_000 + rep,
+            kind=kind,
+        )
+        p_values.append(perm["p_value"])
+        overlaps.append(len(set(x_idx).intersection(y_idx)))
+
+    return [
+        _independent_null_row(
+            background=background,
+            kind=kind,
+            n=n,
+            k=k,
+            magnitude=magnitude,
+            alpha=alpha,
+            repetitions=repetitions,
+            n_perm=n_perm,
+            p_values=p_values,
+            overlaps=overlaps,
+        )
+        for alpha in alphas
+    ]
+
+
+def variant_comparison_simulation(
+    *,
+    n: int = 40,
+    k: int = 2,
+    magnitude: float = 8.0,
+    repetitions: int = 200,
+    n_perm: int = 499,
+    seed: int = 123,
+    backgrounds: list[str] | None = None,
+    kinds: list[str] | None = None,
+    scenarios: list[str] | None = None,
+    alpha: float = 0.05,
+) -> list[dict[str, float | str]]:
+    """Compare L2 and L1 divergence definitions under the same scenarios."""
+    if backgrounds is None:
+        backgrounds = ["normal", "t3", "lognormal"]
+    if kinds is None:
+        kinds = ["l2", "l1"]
+    if scenarios is None:
+        scenarios = ["matched", "negative_control", "independent_null"]
+
+    rows = []
+    for kind_offset, kind in enumerate(kinds):
+        for bg_offset, background in enumerate(backgrounds):
+            for scenario_offset, scenario in enumerate(scenarios):
+                values = []
+                overlaps = []
+                for rep in range(repetitions):
+                    row_seed = (
+                        seed
+                        + kind_offset * 10_000_000
+                        + bg_offset * 1_000_000
+                        + scenario_offset * 100_000
+                        + rep
+                    )
+                    if scenario == "matched":
+                        x, y, _ = make_multi_extreme_scenario(
+                            n=n,
+                            k=k,
+                            seed=row_seed,
+                            magnitude=magnitude,
+                            background=background,
+                            matched=True,
+                        )
+                        overlaps.append(k)
+                    elif scenario == "negative_control":
+                        x, y, _ = make_multi_extreme_scenario(
+                            n=n,
+                            k=k,
+                            seed=row_seed,
+                            magnitude=magnitude,
+                            background=background,
+                            matched=False,
+                        )
+                        overlaps.append(0)
+                    elif scenario == "independent_null":
+                        x, y, x_idx, y_idx = make_independent_extreme_scenario(
+                            n=n,
+                            k=k,
+                            seed=row_seed,
+                            magnitude=magnitude,
+                            background=background,
+                        )
+                        overlaps.append(len(set(x_idx).intersection(y_idx)))
+                    else:
+                        raise ValueError(f"unknown scenario: {scenario}")
+
+                    kept = c_delta(x, y, kind=kind)
+                    perm = permutation_test(
+                        x,
+                        y,
+                        n_perm=n_perm,
+                        seed=seed + 8_000_000 + row_seed,
+                        kind=kind,
+                    )
+                    values.append(
+                        {
+                            "raw": kept.raw,
+                            "norm": kept.normalized_pairing,
+                            "corr": kept.direction_correlation,
+                            "p": perm["p_value"],
+                            "reject": float(perm["p_value"] < alpha),
+                        }
+                    )
+
+                reject_count = int(sum(v["reject"] for v in values))
+                ci_low, ci_high = _wilson_interval(reject_count, repetitions)
+                p_values = [v["p"] for v in values]
+                quantiles = np.quantile(p_values, [0.05, 0.5, 0.95])
+                rows.append(
+                    {
+                        "kind": kind,
+                        "background": background,
+                        "scenario": scenario,
+                        "n": n,
+                        "k_extremes": k,
+                        "magnitude": magnitude,
+                        "alpha": alpha,
+                        "repetitions": repetitions,
+                        "n_perm": n_perm,
+                        "reject_count": reject_count,
+                        "rejection_rate": round(float(reject_count / repetitions), 4),
+                        "wilson_low": round(float(ci_low), 4),
+                        "wilson_high": round(float(ci_high), 4),
+                        "mean_raw": round(float(np.mean([v["raw"] for v in values])), 4),
+                        "mean_norm": round(float(np.mean([v["norm"] for v in values])), 4),
+                        "mean_corr": round(float(np.mean([v["corr"] for v in values])), 4),
+                        "mean_p": round(float(np.mean(p_values)), 4),
+                        "p05": round(float(quantiles[0]), 4),
+                        "p50": round(float(quantiles[1]), 4),
+                        "p95": round(float(quantiles[2]), 4),
+                        "mean_index_overlap": round(float(np.mean(overlaps)), 4),
+                    }
+                )
+    return rows
+
+
+def _multi_extreme_samples_for_scenario(
+    *,
+    scenario: str,
+    n: int,
+    k: int,
+    magnitude: float,
+    background: str,
+    seed: int,
+) -> tuple[Array, Array, int]:
+    if scenario == "matched":
+        x, y, _ = make_multi_extreme_scenario(
+            n=n,
+            k=k,
+            seed=seed,
+            magnitude=magnitude,
+            background=background,
+            matched=True,
+        )
+        return x, y, k
+    if scenario == "negative_control":
+        x, y, _ = make_multi_extreme_scenario(
+            n=n,
+            k=k,
+            seed=seed,
+            magnitude=magnitude,
+            background=background,
+            matched=False,
+        )
+        return x, y, 0
+    if scenario == "independent_null":
+        x, y, x_idx, y_idx = make_independent_extreme_scenario(
+            n=n,
+            k=k,
+            seed=seed,
+            magnitude=magnitude,
+            background=background,
+        )
+        return x, y, len(set(x_idx).intersection(y_idx))
+    raise ValueError(f"unknown scenario: {scenario}")
+
+
+def calibrated_subgroup_simulation(
+    *,
+    n: int = 40,
+    k_values: list[int] | None = None,
+    magnitude_grid: list[float] | None = None,
+    target_corr: float | None = None,
+    reference_k: int = 1,
+    reference_magnitude: float = 8.0,
+    calibration_repetitions: int = 120,
+    evaluation_repetitions: int = 250,
+    n_perm: int = 499,
+    seed: int = 123,
+    background: str = "normal",
+    kind: str = "l2",
+    scenarios: list[str] | None = None,
+    alpha: float = 0.05,
+) -> list[dict[str, float | str]]:
+    """Compare subgroup sizes after matching approximate signal strength.
+
+    The calibration step chooses one magnitude per ``k`` whose matched-condition
+    mean divergence-vector correlation is closest to either an explicit target
+    or the reference condition. This separates the effect of subgroup size from
+    the simpler fact that more extreme observations can also create a stronger
+    alternative.
+    """
+    if k_values is None:
+        k_values = [1, 2, 3]
+    if magnitude_grid is None:
+        magnitude_grid = [2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 12.0]
+    if scenarios is None:
+        scenarios = ["matched", "negative_control", "independent_null"]
+    if target_corr is not None and not -1.0 <= target_corr <= 1.0:
+        raise ValueError("target_corr must be between -1 and 1")
+    if reference_k not in k_values:
+        raise ValueError("reference_k must be included in k_values")
+    if reference_magnitude not in magnitude_grid:
+        raise ValueError("reference_magnitude must be included in magnitude_grid")
+
+    calibration: dict[int, list[dict[str, float]]] = {k: [] for k in k_values}
+    for k_offset, k in enumerate(k_values):
+        for mag_offset, magnitude in enumerate(magnitude_grid):
+            values = []
+            for rep in range(calibration_repetitions):
+                row_seed = (
+                    seed
+                    + k_offset * 1_000_000
+                    + mag_offset * 10_000
+                    + rep
+                )
+                x, y, _ = make_multi_extreme_scenario(
+                    n=n,
+                    k=k,
+                    seed=row_seed,
+                    magnitude=magnitude,
+                    background=background,
+                    matched=True,
+                )
+                result = c_delta(x, y, kind=kind)
+                values.append(
+                    {
+                        "corr": result.direction_correlation,
+                        "norm": result.normalized_pairing,
+                    }
+                )
+            calibration[k].append(
+                {
+                    "magnitude": magnitude,
+                    "mean_corr": float(np.mean([v["corr"] for v in values])),
+                    "mean_norm": float(np.mean([v["norm"] for v in values])),
+                }
+            )
+
+    if target_corr is None:
+        reference_rows = [
+            row
+            for row in calibration[reference_k]
+            if row["magnitude"] == reference_magnitude
+        ]
+        target_value = reference_rows[0]["mean_corr"]
+        target_reference = f"k={reference_k}, magnitude={reference_magnitude}"
+    else:
+        target_value = target_corr
+        target_reference = f"explicit target_corr={target_corr}"
+
+    selected = {
+        k: min(calibration[k], key=lambda row: abs(row["mean_corr"] - target_value))
+        for k in k_values
+    }
+
+    rows = []
+    for k_offset, k in enumerate(k_values):
+        selected_magnitude = selected[k]["magnitude"]
+        for scenario_offset, scenario in enumerate(scenarios):
+            values = []
+            overlaps = []
+            for rep in range(evaluation_repetitions):
+                row_seed = (
+                    seed
+                    + 5_000_000
+                    + k_offset * 1_000_000
+                    + scenario_offset * 100_000
+                    + rep
+                )
+                x, y, overlap = _multi_extreme_samples_for_scenario(
+                    scenario=scenario,
+                    n=n,
+                    k=k,
+                    magnitude=selected_magnitude,
+                    background=background,
+                    seed=row_seed,
+                )
+                kept = c_delta(x, y, kind=kind)
+                perm = permutation_test(
+                    x,
+                    y,
+                    n_perm=n_perm,
+                    seed=seed + 9_000_000 + row_seed,
+                    kind=kind,
+                )
+                values.append(
+                    {
+                        "raw": kept.raw,
+                        "norm": kept.normalized_pairing,
+                        "corr": kept.direction_correlation,
+                        "p": perm["p_value"],
+                        "reject": float(perm["p_value"] < alpha),
+                    }
+                )
+                overlaps.append(overlap)
+
+            reject_count = int(sum(v["reject"] for v in values))
+            ci_low, ci_high = _wilson_interval(reject_count, evaluation_repetitions)
+            p_values = [v["p"] for v in values]
+            p_quantiles = np.quantile(p_values, [0.05, 0.5, 0.95])
+            rows.append(
+                {
+                    "background": background,
+                    "kind": kind,
+                    "n": n,
+                    "k_extremes": k,
+                    "scenario": scenario,
+                    "target_reference": target_reference,
+                    "target_corr": round(float(target_value), 4),
+                    "selected_magnitude": selected_magnitude,
+                    "calibrated_mean_corr": round(
+                        float(selected[k]["mean_corr"]), 4
+                    ),
+                    "calibrated_mean_norm": round(
+                        float(selected[k]["mean_norm"]), 4
+                    ),
+                    "alpha": alpha,
+                    "calibration_repetitions": calibration_repetitions,
+                    "evaluation_repetitions": evaluation_repetitions,
+                    "n_perm": n_perm,
+                    "reject_count": reject_count,
+                    "rejection_rate": round(
+                        float(reject_count / evaluation_repetitions), 4
+                    ),
+                    "wilson_low": round(float(ci_low), 4),
+                    "wilson_high": round(float(ci_high), 4),
+                    "mean_raw": round(float(np.mean([v["raw"] for v in values])), 4),
+                    "mean_norm": round(float(np.mean([v["norm"] for v in values])), 4),
+                    "mean_corr": round(float(np.mean([v["corr"] for v in values])), 4),
+                    "mean_p": round(float(np.mean(p_values)), 4),
+                    "p05": round(float(p_quantiles[0]), 4),
+                    "p50": round(float(p_quantiles[1]), 4),
+                    "p95": round(float(p_quantiles[2]), 4),
+                    "mean_index_overlap": round(float(np.mean(overlaps)), 4),
+                }
+            )
+    return rows
+
+
+def _independent_null_row(
+    *,
+    background: str,
+    kind: str,
+    n: int,
+    k: int,
+    magnitude: float,
+    alpha: float,
+    repetitions: int,
+    n_perm: int,
+    p_values: list[float],
+    overlaps: list[int],
+) -> dict[str, float | str]:
+    reject_count = int(sum(p < alpha for p in p_values))
+    ci_low, ci_high = _wilson_interval(reject_count, repetitions)
+    quantiles = np.quantile(p_values, [0.05, 0.25, 0.5, 0.75, 0.95])
+    return {
+        "background": background,
+        "kind": kind,
+        "n": n,
+        "k_extremes": k,
+        "magnitude": magnitude,
+        "alpha": alpha,
+        "repetitions": repetitions,
+        "n_perm": n_perm,
+        "reject_count": reject_count,
+        "empirical_size": round(float(reject_count / repetitions), 4),
+        "wilson_low": round(float(ci_low), 4),
+        "wilson_high": round(float(ci_high), 4),
+        "mean_p": round(float(np.mean(p_values)), 4),
+        "p05": round(float(quantiles[0]), 4),
+        "p25": round(float(quantiles[1]), 4),
+        "p50": round(float(quantiles[2]), 4),
+        "p75": round(float(quantiles[3]), 4),
+        "p95": round(float(quantiles[4]), 4),
+        "mean_index_overlap": round(float(np.mean(overlaps)), 4),
+    }
+
+
+def summarize_scenarios(
+    scenarios: list[str],
+    *,
+    n: int = 50,
+    seed: int = 123,
+    n_perm: int = 199,
+    n_boot: int = 300,
+) -> list[dict[str, float | str]]:
+    """Run a compact pilot summary for several scenarios."""
+    rows = []
+    for offset, scenario in enumerate(scenarios):
+        x, y = make_scenario(scenario, n, seed=seed + offset)
+        result = c_delta(x, y)
+        perm = permutation_test(x, y, n_perm=n_perm, seed=seed + 1000 + offset)
+        ci = bootstrap_ci(x, y, n_boot=n_boot, seed=seed + 2000 + offset)
+        rows.append(
+            {
+                "scenario": scenario,
+                "raw": round(result.raw, 4),
+                "normalized_pairing": round(result.normalized_pairing, 4),
+                "direction_correlation": round(result.direction_correlation, 4),
+                "perm_p": round(perm["p_value"], 4),
+                "ci_lower": round(ci["lower"], 4),
+                "ci_upper": round(ci["upper"], 4),
+            }
+        )
+    return rows

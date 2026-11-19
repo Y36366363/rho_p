@@ -1,0 +1,14 @@
+{
+  "seed": 2026111801,
+  "replications_per_cell": 1000,
+  "python": "3.12.3",
+  "numpy": "1.26.4",
+  "scipy": "1.16.3",
+  "solver": "score_checked",
+  "generator": "PCG64, SeedSequence([seed, round(100*r), n, replication]); n-by-2 normals",
+  "source_sha256": {
+    "src/cdelta.py": "e552d5d3a47e7b28eb57803b07d4ff053ccc49f1dd8e2be6e9b9b0f1bd958064",
+    "src/rho_profile.py": "1b0654fcc7bbf076c73b2b4c5fe57ff2c09bc4e0f6785e707ebdceadfc369b2d",
+    "scripts/run_gaussian_positive_control.py": "11ff9c17532abe187042f3bc8c62991fbd35ea16674342ff1b34d2761bf9c2cc"
+  }
+}

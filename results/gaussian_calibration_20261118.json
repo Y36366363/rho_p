@@ -1,0 +1,12 @@
+{
+  "cells": 6,
+  "valid": 6000,
+  "covered": 5648,
+  "coverage": 0.9413333333333334,
+  "descriptive_wilson_low": 0.9350999475516185,
+  "descriptive_wilson_high": 0.9470019594231648,
+  "equal_weight_stratified_mcse": 0.0030348786245983257,
+  "all_cells_below_nominal": true,
+  "minimum_cell_coverage": 0.936,
+  "maximum_cell_coverage": 0.946
+}

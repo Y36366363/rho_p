@@ -1,0 +1,146 @@
+{
+  "mechanism": [
+    {
+      "tau": 0.1,
+      "n": 80,
+      "replications": 2000,
+      "mean_abs_median": 0.7816927295111766,
+      "mean_scale": 0.5349305347468216,
+      "reference_correlation": 0.9846811084374242,
+      "stage23_max_gap": 2.1094237467877974e-15,
+      "stage23_min_active_fraction": 1.0,
+      "full_mean_active_fraction": 0.473259375
+    },
+    {
+      "tau": 0.1,
+      "n": 640,
+      "replications": 2000,
+      "mean_abs_median": 0.7952753500847924,
+      "mean_scale": 0.6179382056495937,
+      "reference_correlation": 0.9867059717742671,
+      "stage23_max_gap": 8.326672684688674e-16,
+      "stage23_min_active_fraction": 1.0,
+      "full_mean_active_fraction": 0.371858203125
+    },
+    {
+      "tau": 0.4,
+      "n": 80,
+      "replications": 2000,
+      "mean_abs_median": 0.5244691088701565,
+      "mean_scale": 1.4784539675255814,
+      "reference_correlation": 0.8930562919027031,
+      "stage23_max_gap": 0.01702952945669106,
+      "stage23_min_active_fraction": 0.8375,
+      "full_mean_active_fraction": 0.942940625
+    },
+    {
+      "tau": 0.4,
+      "n": 640,
+      "replications": 2000,
+      "mean_abs_median": 0.4448798678566941,
+      "mean_scale": 1.5920824646672822,
+      "reference_correlation": 0.8693212628491792,
+      "stage23_max_gap": 0.003466791558371273,
+      "stage23_min_active_fraction": 0.9265625,
+      "full_mean_active_fraction": 0.97130078125
+    }
+  ],
+  "intervals": [
+    {
+      "log_sd": 0.6,
+      "n": 160,
+      "replications": 2000,
+      "wald_coverage": 0.858,
+      "fisher_coverage": 0.8695,
+      "paired_difference": 0.0115,
+      "paired_difference_mcse": 0.0028614627351220643,
+      "below_truth": 0.1115,
+      "above_truth": 0.0305,
+      "mean_se_over_sd": 0.8396998738239717
+    },
+    {
+      "log_sd": 0.6,
+      "n": 640,
+      "replications": 2000,
+      "wald_coverage": 0.9115,
+      "fisher_coverage": 0.9145,
+      "paired_difference": 0.003,
+      "paired_difference_mcse": 0.0017311841321042728,
+      "below_truth": 0.0695,
+      "above_truth": 0.019,
+      "mean_se_over_sd": 0.8999001283634827
+    },
+    {
+      "log_sd": 0.6,
+      "n": 2560,
+      "replications": 2000,
+      "wald_coverage": 0.927,
+      "fisher_coverage": 0.9285,
+      "paired_difference": 0.0015,
+      "paired_difference_mcse": 0.001322781113766548,
+      "below_truth": 0.0595,
+      "above_truth": 0.0135,
+      "mean_se_over_sd": 0.9664056171169936
+    },
+    {
+      "log_sd": 0.3,
+      "n": 160,
+      "replications": 2000,
+      "wald_coverage": 0.9045,
+      "fisher_coverage": 0.9135,
+      "paired_difference": 0.009,
+      "paired_difference_mcse": 0.0024418192481468217,
+      "below_truth": 0.0655,
+      "above_truth": 0.03,
+      "mean_se_over_sd": 0.9102543718270694
+    },
+    {
+      "log_sd": 0.3,
+      "n": 640,
+      "replications": 2000,
+      "wald_coverage": 0.9355,
+      "fisher_coverage": 0.935,
+      "paired_difference": -0.0005,
+      "paired_difference_mcse": 0.00132315924029861,
+      "below_truth": 0.042,
+      "above_truth": 0.0225,
+      "mean_se_over_sd": 0.982462825502009
+    },
+    {
+      "log_sd": 0.3,
+      "n": 2560,
+      "replications": 2000,
+      "wald_coverage": 0.9365,
+      "fisher_coverage": 0.9375,
+      "paired_difference": 0.001,
+      "paired_difference_mcse": 0.0007069298939339522,
+      "below_truth": 0.043,
+      "above_truth": 0.0205,
+      "mean_se_over_sd": 0.9680912514559257
+    }
+  ],
+  "population_se_coverage": [
+    {
+      "log_sd": 0.6,
+      "n": 160,
+      "coverage": 0.9675
+    },
+    {
+      "log_sd": 0.6,
+      "n": 640,
+      "coverage": 0.959
+    },
+    {
+      "log_sd": 0.6,
+      "n": 2560,
+      "coverage": 0.958
+    }
+  ],
+  "population_source_sha256": "2fb15d2ad111c0f6cc556c4ce1626e2ba3762a77e01bb32c538c630e6c2fc162",
+  "source_sha256": {
+    "reference_pathway_replications_20260909.tsv": "e61e1b35cc8c356f4e8c35d11194ac168b0dd77b1f4ddf913a0b2ab44147f15a",
+    "active_nuisance_replications_20260907.tsv": "329483b8184f37b5b49471ba9606b5a675f75f215b03f85bd85efac533eab558",
+    "moderate_benchmark_replications_20260920.tsv": "f40cda47a9c8ad1f4e979e3960d9b9fcd0531fd88613c40a5d5c0bce5c936ec6"
+  },
+  "new_simulation_cells": 0
+}
