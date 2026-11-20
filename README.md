@@ -46,4 +46,4 @@ The table command creates nine LaTeX table bodies, `tables.json` and an input-ha
 
 ## License
 
-No license has been selected yet.
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
